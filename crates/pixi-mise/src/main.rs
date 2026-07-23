@@ -12,11 +12,13 @@ use pixi_mise_core::pixi::{
     remove_tool_meta, resolve_prefix, unexpose_binaries,
 };
 use pixi_mise_core::{
-    ConfigSource, Lockfile, RegistrySettings, ToolOptions, VersionSpec, add_tool_to_global_config,
-    add_tool_to_pixi_toml, cache_root, clear_cache, find_workspace_root, import_mise_tools,
-    install_tool, invalidate_cached_asset, load_global_tools, load_workspace_tools,
-    lookup_registry_hints, normalize_tool_arg, parse_tool_spec, remove_tool_from_global_config,
-    remove_tool_from_pixi_toml, resolve_tool_with_settings, tool_request_from_spec,
+    ConfigSource, FeatureName, Lockfile, RegistrySettings, ToolOptions, VersionSpec,
+    add_tool_to_global_config, add_tool_to_pixi_toml, cache_root, cleanup_feature_activation,
+    clear_cache, ensure_activation_hooks, envs_including_feature, find_workspace_root,
+    import_mise_tools, install_tool, invalidate_cached_asset, load_global_tools,
+    load_workspace_tools, lookup_registry_hints, normalize_tool_arg, parse_tool_spec,
+    remove_tool_from_global_config, remove_tool_from_pixi_toml, resolve_tool_with_settings,
+    tool_request_from_spec, tool_request_from_spec_feature, tools_for_environment,
     workspace_registry_settings,
 };
 use tracing_subscriber::EnvFilter;
@@ -106,12 +108,21 @@ enum Commands {
     Add {
         /// Tool spec, e.g. `github:BurntSushi/ripgrep@14`.
         tool: String,
+        /// Pixi feature to add the tool to (default feature when omitted).
+        #[arg(short = 'f', long, default_value = "default")]
+        feature: String,
+        /// Do not wire Pixi activation hooks for this feature.
+        #[arg(long)]
+        no_activation: bool,
     },
     /// Remove a tool from config and uninstall binaries.
     #[command(visible_alias = "rm")]
     Remove {
         /// Tool id, e.g. `github:BurntSushi/ripgrep`.
         tool: String,
+        /// Pixi feature to remove the tool from (default feature when omitted).
+        #[arg(short = 'f', long, default_value = "default")]
+        feature: String,
     },
     /// Install tools from workspace config.
     #[command(visible_alias = "i")]
@@ -133,6 +144,9 @@ enum Commands {
     Upgrade {
         /// Optional single tool to upgrade.
         tool: Option<String>,
+        /// Pixi feature whose tools should be upgraded (default feature when omitted).
+        #[arg(short = 'f', long, default_value = "default")]
+        feature: String,
     },
     /// List configured / installed tools.
     #[command(visible_alias = "ls")]
@@ -229,19 +243,44 @@ fn run(cli: Cli) -> Result<()> {
     let host = HostPlatform::detect();
     let dry_run = cli.dry_run;
     let locked = cli.locked;
+    let env_explicit = cli.environment.is_some();
 
     match cli.command {
-        Commands::Add { tool } => cmd_add(&tool, &env, &host, dry_run, locked),
-        Commands::Remove { tool } => cmd_remove(&tool, &env, dry_run),
+        Commands::Add {
+            tool,
+            feature,
+            no_activation,
+        } => cmd_add(
+            &tool,
+            &FeatureName::parse(&feature),
+            cli.environment.as_deref(),
+            no_activation,
+            &host,
+            dry_run,
+            locked,
+        ),
+        Commands::Remove { tool, feature } => {
+            cmd_remove(&tool, &FeatureName::parse(&feature), &env, dry_run)
+        }
         Commands::Install { tool } => cmd_install(tool.as_deref(), &env, &host, dry_run, locked),
-        Commands::List => cmd_list(&env),
+        Commands::List => cmd_list(if env_explicit {
+            Some(env.as_str())
+        } else {
+            None
+        }),
         Commands::Resolve { tool } => cmd_resolve(tool.as_deref(), &host, locked),
         Commands::Registry { tool, tag } => cmd_registry(&tool, tag.as_deref(), &host),
         Commands::Lock => cmd_lock(&host),
         Commands::ImportMise => cmd_import_mise(dry_run),
         Commands::Reinstall { tool } => cmd_reinstall(tool.as_deref(), &env, &host, dry_run),
         Commands::Update { tool } => cmd_update(tool.as_deref(), &env, &host, dry_run),
-        Commands::Upgrade { tool } => cmd_upgrade(tool.as_deref(), &env, &host, dry_run),
+        Commands::Upgrade { tool, feature } => cmd_upgrade(
+            tool.as_deref(),
+            &FeatureName::parse(&feature),
+            &env,
+            &host,
+            dry_run,
+        ),
         Commands::Search { tool } => cmd_search(&tool),
         Commands::Which { bin } => cmd_which(&bin, &env),
         Commands::Clean {
@@ -311,37 +350,56 @@ fn skip_unsupported(err: &miette::Report, tool: &str) -> bool {
     }
 }
 
-fn cmd_add(tool: &str, env: &str, host: &HostPlatform, dry_run: bool, locked: bool) -> Result<()> {
+fn cmd_add(
+    tool: &str,
+    feature: &FeatureName,
+    environment: Option<&str>,
+    no_activation: bool,
+    host: &HostPlatform,
+    dry_run: bool,
+    locked: bool,
+) -> Result<()> {
     let root = workspace_root()?;
     let pixi_toml = root.join("pixi.toml");
     let (id, version) = parse_tool_spec(&normalize_tool_arg(tool)).into_diagnostic()?;
     let options = ToolOptions::default();
+    let table = feature.tools_table();
 
     if dry_run {
         println!(
-            "would add {} @ {} to {}",
+            "would add {} @ {} to {} ({table})",
             id.github_spec(),
             version.to_config_string(),
             pixi_toml.display()
         );
     } else {
-        add_tool_to_pixi_toml(&pixi_toml, &id, &version, &options)
+        add_tool_to_pixi_toml(&pixi_toml, &id, &version, &options, feature)
             .into_diagnostic()
             .wrap_err("failed to update pixi.toml")?;
         println!(
-            "added {} = \"{}\"",
+            "added {} = \"{}\" [{}]",
             id.github_spec(),
-            version.to_config_string()
+            version.to_config_string(),
+            feature
         );
+
+        let cfg = load_workspace_tools(&root).into_diagnostic()?;
+        if cfg.activation_enabled && !no_activation {
+            ensure_activation_hooks(&root, &pixi_toml, feature)
+                .into_diagnostic()
+                .wrap_err("failed to wire Pixi activation hooks")?;
+            println!("wired activation hooks for feature `{feature}`");
+        }
     }
 
-    let mut request = tool_request_from_spec(
+    let mut request = tool_request_from_spec_feature(
         &id.github_spec(),
         ConfigSource {
             path: pixi_toml.clone(),
-            table: "tool.pixi-mise.tools".into(),
+            table,
         },
         options,
+        feature.clone(),
     )
     .into_diagnostic()?;
     request.version = version;
@@ -357,14 +415,31 @@ fn cmd_add(tool: &str, env: &str, host: &HostPlatform, dry_run: bool, locked: bo
         resolved.asset.name
     );
 
-    let target = InstallTarget::Local {
-        workspace_root: root,
-        env: env.to_string(),
+    let cfg = load_workspace_tools(&root).into_diagnostic()?;
+    let targets: Vec<String> = if let Some(env) = environment {
+        vec![env.to_string()]
+    } else {
+        let envs = envs_including_feature(&cfg.environments, feature);
+        if envs.is_empty() {
+            eprintln!(
+                "warning: no Pixi environment includes feature `{feature}`; \
+                 config updated but nothing was installed (pass --environment or add the feature to [environments])"
+            );
+            return Ok(());
+        }
+        envs
     };
-    let outcome = install_tool(&client, &resolved, &target, host, dry_run)
-        .into_diagnostic()
-        .wrap_err("failed to install tool")?;
-    print_install_outcome(&outcome, dry_run);
+
+    for env in targets {
+        let target = InstallTarget::Local {
+            workspace_root: root.clone(),
+            env: env.clone(),
+        };
+        let outcome = install_tool(&client, &resolved, &target, host, dry_run)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to install tool into environment `{env}`"))?;
+        print_install_outcome(&outcome, dry_run);
+    }
     Ok(())
 }
 
@@ -381,19 +456,20 @@ fn cmd_install(
         .wrap_err("failed to load workspace tools")?;
     let registry = cfg.registry.clone();
 
-    let requests = if let Some(spec) = tool {
+    let mut requests = tools_for_environment(&cfg, env).into_diagnostic()?;
+    if let Some(spec) = tool {
         let (id, _) = parse_tool_spec(&normalize_tool_arg(spec)).into_diagnostic()?;
-        let found =
-            cfg.tools.into_iter().find(|t| t.id == id).ok_or_else(|| {
-                miette!("tool `{}` is not configured in pixi.toml", id.github_spec())
-            })?;
-        vec![found]
-    } else {
-        cfg.tools
-    };
+        requests.retain(|t| t.id == id);
+        if requests.is_empty() {
+            return Err(miette!(
+                "tool `{}` is not configured for environment `{env}`",
+                id.github_spec()
+            ));
+        }
+    }
 
     if requests.is_empty() {
-        println!("no tools configured under [tool.pixi-mise.tools]");
+        println!("no pixi-mise tools configured for environment `{env}`");
         return Ok(());
     }
 
@@ -440,52 +516,71 @@ fn print_install_outcome(outcome: &pixi_mise_core::InstallOutcome, dry_run: bool
     }
 }
 
-fn cmd_list(env: &str) -> Result<()> {
+fn cmd_list(environment: Option<&str>) -> Result<()> {
     let root = workspace_root()?;
     let cfg = load_workspace_tools(&root).into_diagnostic()?;
     let meta_root = root.join(".pixi");
-    let installed = list_tool_meta(&meta_root, env).into_diagnostic()?;
 
-    if cfg.tools.is_empty() && installed.is_empty() {
-        println!("(no pixi-mise tools configured or installed)");
+    if cfg.tools.is_empty() {
+        let env = environment.unwrap_or("default");
+        let installed = list_tool_meta(&meta_root, env).into_diagnostic()?;
+        if installed.is_empty() {
+            println!("(no pixi-mise tools configured or installed)");
+            return Ok(());
+        }
+    }
+
+    if let Some(env) = environment {
+        let requests = tools_for_environment(&cfg, env).into_diagnostic()?;
+        let installed = list_tool_meta(&meta_root, env).into_diagnostic()?;
+        println!(
+            "{:<36} {:<10} {:<12} {:<12} BINS",
+            "TOOL", "FEATURE", "REQUESTED", "INSTALLED"
+        );
+        for req in &requests {
+            let id = req.id.github_spec();
+            let meta = installed.iter().find(|m| m.id == id);
+            let installed_ver = meta.map(|m| m.version.as_str()).unwrap_or("-");
+            let bins = meta
+                .map(|m| m.installed_bins.join(", "))
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "{:<36} {:<10} {:<12} {:<12} {}",
+                id,
+                req.feature.as_str(),
+                req.version.to_config_string(),
+                installed_ver,
+                bins
+            );
+        }
+        for meta in &installed {
+            if !requests.iter().any(|t| t.id.github_spec() == meta.id) {
+                println!(
+                    "{:<36} {:<10} {:<12} {:<12} {} (orphaned)",
+                    meta.id,
+                    "-",
+                    "-",
+                    meta.version,
+                    meta.installed_bins.join(", ")
+                );
+            }
+        }
         return Ok(());
     }
 
-    println!(
-        "{:<36} {:<12} {:<12} BINS",
-        "TOOL", "REQUESTED", "INSTALLED"
-    );
+    println!("{:<36} {:<10} {:<12} BINS", "TOOL", "FEATURE", "REQUESTED");
     for req in &cfg.tools {
-        let id = req.id.github_spec();
-        let meta = installed.iter().find(|m| m.id == id);
-        let installed_ver = meta.map(|m| m.version.as_str()).unwrap_or("-");
-        let bins = meta
-            .map(|m| m.installed_bins.join(", "))
-            .unwrap_or_else(|| "-".into());
         println!(
-            "{:<36} {:<12} {:<12} {}",
-            id,
+            "{:<36} {:<10} {:<12} -",
+            req.id.github_spec(),
+            req.feature.as_str(),
             req.version.to_config_string(),
-            installed_ver,
-            bins
         );
-    }
-
-    for meta in &installed {
-        if !cfg.tools.iter().any(|t| t.id.github_spec() == meta.id) {
-            println!(
-                "{:<36} {:<12} {:<12} {} (orphaned)",
-                meta.id,
-                "-",
-                meta.version,
-                meta.installed_bins.join(", ")
-            );
-        }
     }
     Ok(())
 }
 
-fn cmd_remove(tool: &str, env: &str, dry_run: bool) -> Result<()> {
+fn cmd_remove(tool: &str, feature: &FeatureName, env: &str, dry_run: bool) -> Result<()> {
     let root = workspace_root()?;
     let pixi_toml = root.join("pixi.toml");
     let (id, _) = parse_tool_spec(&normalize_tool_arg(tool)).into_diagnostic()?;
@@ -521,13 +616,20 @@ fn cmd_remove(tool: &str, env: &str, dry_run: bool) -> Result<()> {
     }
 
     if dry_run {
-        println!("would remove {tool_id} from {}", pixi_toml.display());
+        println!(
+            "would remove {tool_id} from {} ({})",
+            pixi_toml.display(),
+            feature.tools_table()
+        );
     } else {
-        let removed = remove_tool_from_pixi_toml(&pixi_toml, &id).into_diagnostic()?;
+        let removed = remove_tool_from_pixi_toml(&pixi_toml, &id, feature).into_diagnostic()?;
         if removed {
-            println!("removed {tool_id} from pixi.toml");
+            println!("removed {tool_id} from pixi.toml [{}]", feature);
+            cleanup_feature_activation(&root, &pixi_toml, feature)
+                .into_diagnostic()
+                .wrap_err("failed to clean up activation hooks")?;
         } else {
-            println!("{tool_id} was not present in pixi.toml");
+            println!("{tool_id} was not present in {}", feature.tools_table());
         }
     }
     Ok(())
@@ -929,11 +1031,12 @@ fn cmd_update(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool)
         .into_diagnostic()
         .wrap_err("failed to load workspace tools")?;
     let registry = cfg.registry.clone();
-    let requests = filter_requests(cfg.tools, tool, |id| {
-        format!("tool `{id}` is not configured in pixi.toml")
+    let env_tools = tools_for_environment(&cfg, env).into_diagnostic()?;
+    let requests = filter_requests(env_tools, tool, |id| {
+        format!("tool `{id}` is not configured for environment `{env}`")
     })?;
     if requests.is_empty() {
-        println!("no tools configured under [tool.pixi-mise.tools]");
+        println!("no pixi-mise tools configured for environment `{env}`");
         return Ok(());
     }
 
@@ -987,18 +1090,29 @@ fn cmd_update(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool)
     Ok(())
 }
 
-fn cmd_upgrade(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool) -> Result<()> {
+fn cmd_upgrade(
+    tool: Option<&str>,
+    feature: &FeatureName,
+    env: &str,
+    host: &HostPlatform,
+    dry_run: bool,
+) -> Result<()> {
     let root = workspace_root()?;
     let pixi_toml = root.join("pixi.toml");
     let cfg = load_workspace_tools(&root)
         .into_diagnostic()
         .wrap_err("failed to load workspace tools")?;
     let registry = cfg.registry.clone();
-    let requests = filter_requests(cfg.tools, tool, |id| {
-        format!("tool `{id}` is not configured in pixi.toml")
+    let feature_tools: Vec<_> = cfg
+        .tools
+        .into_iter()
+        .filter(|t| &t.feature == feature)
+        .collect();
+    let requests = filter_requests(feature_tools, tool, |id| {
+        format!("tool `{id}` is not configured in feature `{feature}`")
     })?;
     if requests.is_empty() {
-        println!("no tools configured under [tool.pixi-mise.tools]");
+        println!("no pixi-mise tools configured for feature `{feature}`");
         return Ok(());
     }
 
@@ -1032,9 +1146,15 @@ fn cmd_upgrade(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool
             resolved.tag
         );
         if !dry_run {
-            add_tool_to_pixi_toml(&pixi_toml, &request.id, &new_spec, &request.options)
-                .into_diagnostic()
-                .wrap_err("failed to update pixi.toml")?;
+            add_tool_to_pixi_toml(
+                &pixi_toml,
+                &request.id,
+                &new_spec,
+                &request.options,
+                feature,
+            )
+            .into_diagnostic()
+            .wrap_err("failed to update pixi.toml")?;
         }
         request.version = new_spec;
         let target = InstallTarget::Local {
@@ -1055,11 +1175,12 @@ fn cmd_reinstall(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bo
         .into_diagnostic()
         .wrap_err("failed to load workspace tools")?;
     let registry = cfg.registry.clone();
-    let requests = filter_requests(cfg.tools, tool, |id| {
-        format!("tool `{id}` is not configured in pixi.toml")
+    let env_tools = tools_for_environment(&cfg, env).into_diagnostic()?;
+    let requests = filter_requests(env_tools, tool, |id| {
+        format!("tool `{id}` is not configured for environment `{env}`")
     })?;
     if requests.is_empty() {
-        println!("no tools configured under [tool.pixi-mise.tools]");
+        println!("no pixi-mise tools configured for environment `{env}`");
         return Ok(());
     }
 
@@ -1348,7 +1469,40 @@ mod tests {
     fn parses_add() {
         let cli = Cli::try_parse_from(["pixi-mise", "add", "github:cli/cli@2"]).unwrap();
         match cli.command {
-            Commands::Add { tool } => assert_eq!(tool, "github:cli/cli@2"),
+            Commands::Add {
+                tool,
+                feature,
+                no_activation,
+            } => {
+                assert_eq!(tool, "github:cli/cli@2");
+                assert_eq!(feature, "default");
+                assert!(!no_activation);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_add_feature() {
+        let cli = Cli::try_parse_from([
+            "pixi-mise",
+            "add",
+            "--feature",
+            "test",
+            "--no-activation",
+            "github:cli/cli",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Add {
+                tool,
+                feature,
+                no_activation,
+            } => {
+                assert_eq!(tool, "github:cli/cli");
+                assert_eq!(feature, "test");
+                assert!(no_activation);
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

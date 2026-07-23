@@ -684,7 +684,7 @@ Actionable errors, modeled on mise:
 - Platform-specific tool filters (`os = ["linux", "macos/arm64"]`) plus aqua `supported_envs`.
 - `pixi mise registry <tool> [--tag …]` to inspect resolved recipes.
 
-### Phase 5 — Feature-scoped local tools
+### Phase 5 — Feature-scoped local tools ✅
 
 - `--feature` / `-f` on local `add` / `remove` / `upgrade`.
 - Read/write `[tool.pixi-mise.feature.<name>.tools]`; parse `[environments]` to union tools per env (respect `no-default-feature`).

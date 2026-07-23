@@ -4,9 +4,7 @@ Install GitHub release binaries into Pixi-managed global or local environments �
 
 ## Status
 
-**Phase 4 (registry)** — Aqua-registry recipes (asset templates, replacements, `supported_envs`), optional local `pixi-mise-registry.toml`, platform `os` filters, and `pixi mise registry`.
-
-**Next: Phase 5** — Feature-scoped local tools (`pixi mise add --feature …`) plus Pixi activation hooks that auto-install on `pixi shell` / `pixi run`.
+**Phase 5 (features + activation)** — Feature-scoped local tools (`pixi mise add --feature …`), env feature-union installs, and Pixi activation hooks that auto-install on `pixi shell` / `pixi run`.
 
 See **[DESIGN.md](./docs/DESIGN.md)** for architecture, resolution pipeline, asset matching, Pixi integration, and implementation phases.
 
