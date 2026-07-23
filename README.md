@@ -11,8 +11,8 @@ Design phase. See **[DESIGN.md](./DESIGN.md)** for architecture, resolution pipe
 Once implemented, the Rust binary ships as `pixi-mise` and is invoked through Pixi:
 
 ```bash
-pixi mise use github:BurntSushi/ripgrep@14
-pixi mise use github:cli/cli --global
+pixi mise add github:BurntSushi/ripgrep@14
+pixi mise global add github:cli/cli
 pixi mise install
 ```
 

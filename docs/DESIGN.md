@@ -110,24 +110,28 @@ pixi mise <subcommand> …
 | Local workspace | `.pixi/envs/<env>/` | Present under `$PREFIX/bin` → available in `pixi shell` / `pixi run` |
 | Global | `$PIXI_HOME/envs/<env>/` | Binary in env `bin/` **and** exposed into `$PIXI_HOME/bin` via global manifest |
 
-v1 installs by placing (or symlinking) binaries into the target prefix’s `bin/` (and updating global exposures when `--global`).
+v1 installs by placing (or symlinking) binaries into the target prefix’s `bin/` (and updating global exposures via `pixi mise global …`).
 
 ## 4. Product Shape
 
 ### 4.1 User experience
 
-```bash
-# Declare tools (workspace)
-pixi mise use github:BurntSushi/ripgrep@14
-pixi mise use github:cli/cli --global
+CLI verbs mirror Pixi itself (`add` / `remove` / `list` / `install` / `update` / `upgrade` / `lock` / `clean`, plus a `global` subcommand) rather than mise’s `use` / `ls` naming.
 
-# Install everything declared for this workspace / global config
+```bash
+# Declare tools (workspace) — same verb as `pixi add`
+pixi mise add github:BurntSushi/ripgrep@14
+
+# Global tools — same shape as `pixi global add`
+pixi mise global add github:cli/cli
+
+# Install everything declared for this workspace
 pixi mise install
 
-# Inspect resolution without installing
-pixi mise resolve
-pixi mise ls
-pixi mise ls-remote github:cli/cli
+# Inspect
+pixi mise list
+pixi mise search github:cli/cli   # remote versions (closest to `pixi search`)
+pixi mise resolve                 # dry-run asset resolution (no Pixi equivalent)
 
 # Remove
 pixi mise remove github:BurntSushi/ripgrep
@@ -170,7 +174,7 @@ Optionally read a subset of `mise.toml` `[tools]` entries that use the `github:`
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│ CLI (pixi-mise)  clap subcommands: use/install/remove/ls…   │
+│ CLI (pixi-mise)  clap: add/install/remove/list/global…      │
 └────────────────────────────┬────────────────────────────────┘
                              │
                              ▼
@@ -292,7 +296,7 @@ Inspired by mise’s hierarchical merge, but anchored on Pixi workspaces.
 1. `./pixi.toml` → `[tool.pixi-mise]`
 2. `./pixi-mise.toml` (optional dedicated file)
 3. Parent directories until filesystem root (or until a `[workspace]` / `[project]` pixi root is found — **stop at workspace root** for tool lists; do not inherit another project’s tools by default)
-4. Global: `$PIXI_HOME/pixi-mise.toml` (always merged for `--global`; optionally merged as defaults for local if we add `inherit_global = true` later)
+4. Global: `$PIXI_HOME/pixi-mise.toml` (always merged for `pixi mise global …`; optionally merged as defaults for local if we add `inherit_global = true` later)
 
 v1 recommendation: **tools are workspace-scoped**. Walking past the Pixi workspace root is not required for the MVP and avoids surprising inheritance.
 
@@ -376,7 +380,7 @@ Map host → Pixi platform string for lockfile keys: `linux-64`, `linux-aarch64`
 3. Extract to staging dir.
 4. Locate binaries (`bin_path`, `bin/`, rename rules, executable bit).
 5. Install into `.pixi/envs/<env>/bin/<name>` (copy or hardlink).
-6. Persist metadata under `.pixi/envs/<env>/conda-meta/pixi-mise-<tool>.json` (or `.pixi/mise/`) so `ls` / `remove` work without scanning heuristics.
+6. Persist metadata under `.pixi/envs/<env>/conda-meta/pixi-mise-<tool>.json` (or `.pixi/mise/`) so `list` / `remove` work without scanning heuristics.
 
 ### 9.2 Global
 
@@ -392,20 +396,45 @@ Generating a noarch/generic `.conda` and installing via rattler would integrate 
 
 ## 10. CLI Surface
 
+Naming follows Pixi’s built-in commands wherever the behavior matches. Aliases match Pixi where applicable (`a`, `i`, `rm`, `ls`).
+
+### 10.1 Workspace commands
+
+| Command | Pixi analogue | Purpose |
+|---------|---------------|---------|
+| `pixi mise add <tool>[@version]` | `pixi add` | Add tool to config + install |
+| `pixi mise remove <tool>` | `pixi remove` | Remove from config + uninstall bins |
+| `pixi mise install [tool]` | `pixi install` | Install from config / one tool |
+| `pixi mise reinstall [tool]` | `pixi reinstall` | Force re-download / re-link bins |
+| `pixi mise update [tool]` | `pixi update` | Re-resolve within version specs; refresh lock + env |
+| `pixi mise upgrade [tool]` | `pixi upgrade` | Loosen / bump version specs in config + refresh lock |
+| `pixi mise list` | `pixi list` | List configured / installed tools |
+| `pixi mise search <tool>` | `pixi search` | List remote versions / releases for a tool |
+| `pixi mise lock` | `pixi lock` | Rewrite lockfile from current resolution (no install) |
+| `pixi mise clean cache` | `pixi clean cache` | Clear download cache |
+
+### 10.2 Global commands
+
+Mirror `pixi global …` instead of a `--global` flag on workspace commands:
+
+| Command | Pixi analogue | Purpose |
+|---------|---------------|---------|
+| `pixi mise global add <tool>` | `pixi global add` | Add + install into global Pixi env / expose |
+| `pixi mise global remove <tool>` | `pixi global remove` | Remove global tool |
+| `pixi mise global install` | `pixi global install` | Install from global config |
+| `pixi mise global list` | `pixi global list` | List global tools |
+| `pixi mise global update [tool]` | `pixi global update` | Update global tools within specs |
+
+### 10.3 Extension-only commands
+
+No direct Pixi equivalent; keep for GitHub-binary workflows:
+
 | Command | Purpose |
 |---------|---------|
-| `pixi mise use <tool>[@version] [options]` | Add tool to config + install |
-| `pixi mise install [tool]` | Install from config / one tool |
-| `pixi mise upgrade [tool]` | Bump within version spec + refresh lock |
-| `pixi mise remove <tool>` | Remove from config + uninstall bins |
-| `pixi mise ls` | List configured / installed tools |
-| `pixi mise ls-remote <tool>` | List remote versions |
-| `pixi mise resolve` | Show resolved assets without installing |
-| `pixi mise lock` | Rewrite lockfile from current resolution |
+| `pixi mise resolve` | Show resolved assets without installing (dry-run) |
 | `pixi mise which <bin>` | Print installed binary path |
-| `pixi mise cache clean` | Clear download cache |
 
-Global flags: `--global`, `--environment`, `--platform` (cross-resolve for lock), `--dry-run`, `--verbose`.
+Shared flags: `--environment`, `--platform` (cross-resolve for lock), `--dry-run` / `-n`, `--verbose`. Prefer Pixi-style update options (`--frozen`, `--locked`, `--no-install`) where they apply.
 
 ## 11. Auth, Cache, Verification
 
@@ -441,17 +470,17 @@ Actionable errors, modeled on mise:
 
 - Parse `[tool.pixi-mise.tools]` from `pixi.toml`.
 - Resolve latest/exact; AssetPicker autodetection.
-- Install into local env `bin/`; `install` / `use` / `ls` / `remove`.
+- Install into local env `bin/`; `add` / `install` / `list` / `remove`.
 
 ### Phase 2 — Global + lockfile
 
-- `--global` path + `$PIXI_HOME/bin` exposure.
+- `pixi mise global …` path + `$PIXI_HOME/bin` exposure.
 - `pixi-mise.lock` with checksums.
 - `matching`, `asset_pattern`, `rename_exe`, `bin`.
 
 ### Phase 3 — Polish
 
-- `ls-remote`, `upgrade`, cache management, better semver.
+- `search`, `update` / `upgrade`, `reinstall`, `clean cache`, better semver.
 - Optional `mise.toml` github-tool import.
 - CI integration tests.
 
@@ -464,13 +493,13 @@ Actionable errors, modeled on mise:
 
 1. **Global exposure API** — Prefer linking into `$PIXI_HOME/bin` directly vs. editing `pixi-global.toml` if a stable schema/API is available.
 2. **Lockfile location** — Commit `pixi-mise.lock` beside `pixi.lock`, or nest under `.pixi/`?
-3. **Upgrade policy for `latest`** — Pin on first install (lockfile) and only bump on `upgrade`, matching mise.lock behavior.
+3. **Upgrade policy for `latest`** — Pin on first install (lockfile); bump within constraints on `update`, loosen manifest specs on `upgrade` (Pixi semantics).
 4. **Windows shims** — Copy `.exe` vs. generate `.cmd` wrappers when exposing globally.
 5. **Multi-env workspaces** — Should tools be per-feature/per-environment in `pixi.toml`, or always default env unless flagged?
 
 ## 16. Success Criteria
 
-- `pixi mise use github:BurntSushi/ripgrep@14` in a Pixi workspace makes `rg` available under `pixi run rg` / `pixi shell`.
-- `pixi mise use github:cli/cli --global` makes `gh` available from `$PIXI_HOME/bin`.
+- `pixi mise add github:BurntSushi/ripgrep@14` in a Pixi workspace makes `rg` available under `pixi run rg` / `pixi shell`.
+- `pixi mise global add github:cli/cli` makes `gh` available from `$PIXI_HOME/bin`.
 - Same config resolves correct assets on `linux-64`, `osx-arm64`, and `win-64` without per-OS `asset_pattern` for well-named releases.
 - Lockfile enables bit-for-bit reproducible CI installs when checksums are present.
