@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/pixi-mise",
     "crates/pixi-mise-core",
     "crates/pixi-mise-github",
     "crates/pixi-mise-assets",
     "crates/pixi-mise-pixi",
 ]
+default-members = ["."]
 
 [workspace.package]
 version = "0.1.0"
@@ -37,3 +37,25 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xz2 = "0.1"
 zip = { version = "2.3", default-features = false, features = ["deflate"] }
+
+[package]
+name = "pixi-mise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Install GitHub release binaries into Pixi environments (Pixi extension: pixi mise)"
+readme = "README.md"
+
+[[bin]]
+name = "pixi-mise"
+path = "crates/pixi-mise/src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+miette = { workspace = true }
+pixi-mise-core = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,9 +1,30 @@
 [workspace]
 authors = ["Amirhossein Davoody <amirhossein.davoody@gmail.com>"]
 channels = ["conda-forge"]
+description = "Install GitHub release binaries into Pixi-managed environments"
 name = "pixi-mise"
 platforms = ["linux-64"]
+preview = ["pixi-build"]
 version = "0.1.0"
+
+[package]
+name = "pixi-mise"
+version = "0.1.0"
+description = "Install GitHub release binaries into Pixi environments (Pixi extension: pixi mise)"
+authors = ["Amirhossein Davoody <amirhossein.davoody@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/amirhosseindavoody/pixi-mise"
+
+[package.build.backend]
+name = "pixi-build-rust"
+version = "*"
+channels = [
+    "https://prefix.dev/pixi-build-backends",
+    "https://prefix.dev/conda-forge",
+]
+
+[package.build-dependencies]
+rust = ">=1.97.1,<1.98"
 
 [tasks]
 check = "cargo check --workspace"
@@ -12,6 +33,7 @@ build = "cargo build --workspace"
 clippy = "cargo clippy --workspace --all-targets -- -D warnings"
 fmt = "cargo fmt --all"
 fmt-check = "cargo fmt --all -- --check"
+package = "pixi build -o dist"
 
 [dependencies]
 rust = ">=1.97.1,<1.98"

@@ -10,15 +10,20 @@ See **[DESIGN.md](./docs/DESIGN.md)** for architecture, resolution pipeline, ass
 
 ## Install as a Pixi extension
 
-Pixi discovers extensions named `pixi-{command}` on `PATH` (then under `pixi global` directories). After building:
+Pixi discovers extensions named `pixi-{command}` on `PATH` (then under `pixi global` directories).
+
+### Global install from source (recommended)
+
+This repo defines a Pixi package (`[package]` + `pixi-build-rust` in `pixi.toml`). Install it globally with Pixi so `pixi-mise` lands on `$PIXI_HOME/bin` (ensure that directory is on your `PATH`, same as other `pixi global` tools):
 
 ```bash
-# From this repo (Pixi-managed Rust toolchain)
-pixi run build
-export PATH="$PWD/target/debug:$PATH"
+# From a local clone
+git clone https://github.com/amirhosseindavoody/pixi-mise.git
+cd pixi-mise
+pixi global install --path .
 
-# Or copy / symlink onto PATH
-ln -s "$PWD/target/debug/pixi-mise" ~/.local/bin/pixi-mise
+# Or directly from GitHub
+pixi global install --git https://github.com/amirhosseindavoody/pixi-mise.git
 ```
 
 Then invoke through Pixi:
@@ -26,6 +31,13 @@ Then invoke through Pixi:
 ```bash
 pixi mise --help
 pixi mise add --help
+```
+
+### Development build (without packaging)
+
+```bash
+pixi run build
+export PATH="$PWD/target/debug:$PATH"
 ```
 
 Once published to a conda channel, the recommended install will be `pixi global install pixi-mise`.
@@ -57,13 +69,14 @@ pixi install
 pixi run check
 pixi run test
 pixi run build
+pixi run package   # conda package via pixi-build-rust → dist/
 ```
 
 Workspace layout:
 
 ```text
 crates/
-  pixi-mise/          # binary → pixi-mise
+  pixi-mise/src/      # CLI binary source (package root is Cargo.toml)
   pixi-mise-core/     # types, config, resolve, install
   pixi-mise-github/   # GitHub API client
   pixi-mise-assets/   # AssetPicker scoring

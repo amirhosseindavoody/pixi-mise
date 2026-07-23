@@ -14,3 +14,4 @@
 
 # pixi-mise runtime (future)
 pixi-mise.lock
+dist/
