@@ -226,7 +226,7 @@ pixi-mise/
 │   ├── pixi-mise-core/        # config, types, resolve, install orchestration
 │   ├── pixi-mise-github/      # GitHub API client + release listing
 │   ├── pixi-mise-assets/      # AssetPicker scoring (mise-inspired)
-│   └── pixi-mise-pixi/        # Pixi env/prefix/global manifest integration
+│   └── pixi-mise-pixi/        # Pixi env/prefix + sidecar global expose
 ├── docs/DESIGN.md
 └── README.md
 ```
