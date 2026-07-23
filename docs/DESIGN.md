@@ -468,17 +468,17 @@ Actionable errors, modeled on mise:
 - Library crate stubs: `pixi-mise-github`, `pixi-mise-assets`, `pixi-mise-pixi` (prefix path helper).
 - Document install as Pixi extension (`PATH` / future conda package) in `README.md`.
 
-### Phase 1 — GitHub install MVP
+### Phase 1 — GitHub install MVP ✅
 
 - Parse `[tool.pixi-mise.tools]` from `pixi.toml`.
-- Resolve latest/exact; AssetPicker autodetection.
+- Resolve latest/exact/prefix; AssetPicker autodetection.
 - Install into local env `bin/`; `add` / `install` / `list` / `remove`.
 
 ### Phase 2 — Global + lockfile
 
 - `pixi mise global …` path + `$PIXI_HOME/bin` exposure.
 - `pixi-mise.lock` with checksums.
-- `matching`, `asset_pattern`, `rename_exe`, `bin`.
+- `matching`, `asset_pattern`, `rename_exe`, `bin` (config keys partially accepted in Phase 1).
 
 ### Phase 3 — Polish
 

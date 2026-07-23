@@ -1,9 +1,21 @@
 //! `pixi-mise` — Pixi extension CLI (`pixi mise …`).
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr, miette};
+use pixi_mise_core::assets::HostPlatform;
+use pixi_mise_core::github::GithubClient;
+use pixi_mise_core::pixi::{
+    InstallTarget, list_tool_meta, read_tool_meta, remove_binaries, remove_tool_meta,
+    resolve_prefix,
+};
+use pixi_mise_core::{
+    ConfigSource, ToolOptions, add_tool_to_pixi_toml, find_workspace_root, install_tool,
+    load_workspace_tools, normalize_tool_arg, parse_tool_spec, remove_tool_from_pixi_toml,
+    resolve_tool, tool_request_from_spec,
+};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
@@ -165,6 +177,15 @@ enum GlobalCommands {
 
 fn run(cli: Cli) -> Result<()> {
     if cli.verbose > 0 {
+        // Re-init with a more verbose filter when `-v` is passed.
+        let level = match cli.verbose {
+            1 => "info",
+            _ => "debug",
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(level))
+            .with_writer(std::io::stderr)
+            .try_init();
         tracing::debug!(
             environment = ?cli.environment,
             platform = ?cli.platform,
@@ -174,17 +195,20 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
 
+    let env = cli.environment.clone().unwrap_or_else(|| "default".into());
+    let host = HostPlatform::detect();
+
     match cli.command {
-        Commands::Add { tool } => stub("add", Some(&tool)),
-        Commands::Remove { tool } => stub("remove", Some(&tool)),
-        Commands::Install { tool } => stub("install", tool.as_deref()),
+        Commands::Add { tool } => cmd_add(&tool, &env, &host, cli.dry_run),
+        Commands::Remove { tool } => cmd_remove(&tool, &env, cli.dry_run),
+        Commands::Install { tool } => cmd_install(tool.as_deref(), &env, &host, cli.dry_run),
+        Commands::List => cmd_list(&env),
+        Commands::Resolve { tool } => cmd_resolve(tool.as_deref(), &host),
         Commands::Reinstall { tool } => stub("reinstall", tool.as_deref()),
         Commands::Update { tool } => stub("update", tool.as_deref()),
         Commands::Upgrade { tool } => stub("upgrade", tool.as_deref()),
-        Commands::List => stub("list", None),
         Commands::Search { tool } => stub("search", Some(&tool)),
         Commands::Lock => stub("lock", None),
-        Commands::Resolve { tool } => stub("resolve", tool.as_deref()),
         Commands::Which { bin } => stub("which", Some(&bin)),
         Commands::Clean {
             command: CleanCommands::Cache,
@@ -204,11 +228,10 @@ fn run_global(command: GlobalCommands) -> Result<()> {
 }
 
 fn stub(command: &str, tool: Option<&str>) -> Result<()> {
-    // Validate tool specs early so CLI parsing of github:… is exercised in Phase 0.
     if let Some(spec) = tool
         && (spec.contains(':') || spec.contains('/'))
     {
-        let _ = pixi_mise_core::parse_tool_spec(&normalize_spec(spec)).into_diagnostic()?;
+        let _ = parse_tool_spec(&normalize_tool_arg(spec)).into_diagnostic()?;
     }
 
     let detail = match tool {
@@ -218,17 +241,263 @@ fn stub(command: &str, tool: Option<&str>) -> Result<()> {
 
     miette::bail!(
         "`pixi mise {command}`{detail} is not implemented yet.\n\
-         Phase 0 ships the CLI skeleton only; GitHub install arrives in Phase 1.\n\
+         Phase 1 covers workspace add / install / list / remove.\n\
          See docs/DESIGN.md."
     );
 }
 
-fn normalize_spec(spec: &str) -> String {
-    if spec.starts_with("github:") {
-        spec.to_string()
+fn workspace_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().into_diagnostic()?;
+    find_workspace_root(&cwd).into_diagnostic()
+}
+
+fn cmd_add(tool: &str, env: &str, host: &HostPlatform, dry_run: bool) -> Result<()> {
+    let root = workspace_root()?;
+    let pixi_toml = root.join("pixi.toml");
+    let (id, version) = parse_tool_spec(&normalize_tool_arg(tool)).into_diagnostic()?;
+    let options = ToolOptions::default();
+
+    if dry_run {
+        println!(
+            "would add {} @ {} to {}",
+            id.github_spec(),
+            version.to_config_string(),
+            pixi_toml.display()
+        );
     } else {
-        format!("github:{spec}")
+        add_tool_to_pixi_toml(&pixi_toml, &id, &version, &options)
+            .into_diagnostic()
+            .wrap_err("failed to update pixi.toml")?;
+        println!(
+            "added {} = \"{}\"",
+            id.github_spec(),
+            version.to_config_string()
+        );
     }
+
+    let request = tool_request_from_spec(
+        &id.github_spec(),
+        ConfigSource {
+            path: pixi_toml.clone(),
+            table: "tool.pixi-mise.tools".into(),
+        },
+        options,
+    )
+    .into_diagnostic()?;
+    // Preserve the version from the CLI (@14 etc.); tool_request_from_spec on
+    // the bare id would default to latest.
+    let mut request = request;
+    request.version = version;
+
+    let client = GithubClient::new();
+    let resolved = resolve_tool(&client, &request, host)
+        .into_diagnostic()
+        .wrap_err("failed to resolve tool")?;
+    println!(
+        "resolved {} @ {} → {}",
+        request.id.github_spec(),
+        resolved.tag,
+        resolved.asset.name
+    );
+
+    let outcome = install_tool(&client, &resolved, &root, env, host, dry_run)
+        .into_diagnostic()
+        .wrap_err("failed to install tool")?;
+    if dry_run {
+        println!("would install into {}/bin", outcome.prefix.display());
+    } else {
+        for bin in &outcome.installed_bins {
+            println!("installed {bin} → {}/bin/{bin}", outcome.prefix.display());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_install(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool) -> Result<()> {
+    let root = workspace_root()?;
+    let cfg = load_workspace_tools(&root)
+        .into_diagnostic()
+        .wrap_err("failed to load workspace tools")?;
+
+    let requests = if let Some(spec) = tool {
+        let (id, _) = parse_tool_spec(&normalize_tool_arg(spec)).into_diagnostic()?;
+        let found =
+            cfg.tools.into_iter().find(|t| t.id == id).ok_or_else(|| {
+                miette!("tool `{}` is not configured in pixi.toml", id.github_spec())
+            })?;
+        vec![found]
+    } else {
+        cfg.tools
+    };
+
+    if requests.is_empty() {
+        println!("no tools configured under [tool.pixi-mise.tools]");
+        return Ok(());
+    }
+
+    let client = GithubClient::new();
+    for request in &requests {
+        let resolved = resolve_tool(&client, request, host)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))?;
+        println!(
+            "resolved {} @ {} → {}",
+            request.id.github_spec(),
+            resolved.tag,
+            resolved.asset.name
+        );
+        let outcome = install_tool(&client, &resolved, &root, env, host, dry_run)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to install {}", request.id.github_spec()))?;
+        if dry_run {
+            println!("would install into {}/bin", outcome.prefix.display());
+        } else {
+            for bin in &outcome.installed_bins {
+                println!("installed {bin}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_list(env: &str) -> Result<()> {
+    let root = workspace_root()?;
+    let cfg = load_workspace_tools(&root).into_diagnostic()?;
+    let installed = list_tool_meta(&root, env).into_diagnostic()?;
+
+    if cfg.tools.is_empty() && installed.is_empty() {
+        println!("(no pixi-mise tools configured or installed)");
+        return Ok(());
+    }
+
+    println!(
+        "{:<36} {:<12} {:<12} BINS",
+        "TOOL", "REQUESTED", "INSTALLED"
+    );
+    for req in &cfg.tools {
+        let id = req.id.github_spec();
+        let meta = installed.iter().find(|m| m.id == id);
+        let installed_ver = meta.map(|m| m.version.as_str()).unwrap_or("-");
+        let bins = meta
+            .map(|m| m.installed_bins.join(", "))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<36} {:<12} {:<12} {}",
+            id,
+            req.version.to_config_string(),
+            installed_ver,
+            bins
+        );
+    }
+
+    // Show installed tools no longer in config.
+    for meta in &installed {
+        if !cfg.tools.iter().any(|t| t.id.github_spec() == meta.id) {
+            println!(
+                "{:<36} {:<12} {:<12} {} (orphaned)",
+                meta.id,
+                "-",
+                meta.version,
+                meta.installed_bins.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_remove(tool: &str, env: &str, dry_run: bool) -> Result<()> {
+    let root = workspace_root()?;
+    let pixi_toml = root.join("pixi.toml");
+    let (id, _) = parse_tool_spec(&normalize_tool_arg(tool)).into_diagnostic()?;
+    let tool_id = id.github_spec();
+
+    let meta = read_tool_meta(&root, env, &tool_id).into_diagnostic()?;
+    if let Some(meta) = &meta {
+        let prefix = resolve_prefix(&InstallTarget::Local {
+            workspace_root: root.clone(),
+            env: env.to_string(),
+        })
+        .into_diagnostic()?;
+        if dry_run {
+            println!(
+                "would remove bins {:?} from {}",
+                meta.installed_bins,
+                prefix.join("bin").display()
+            );
+        } else {
+            remove_binaries(&prefix, &meta.installed_bins).into_diagnostic()?;
+            remove_tool_meta(&root, env, &tool_id).into_diagnostic()?;
+            for bin in &meta.installed_bins {
+                println!("removed {bin}");
+            }
+        }
+    } else {
+        println!("no install metadata for {tool_id} (config entry will still be removed)");
+    }
+
+    if dry_run {
+        println!("would remove {tool_id} from {}", pixi_toml.display());
+    } else {
+        let removed = remove_tool_from_pixi_toml(&pixi_toml, &id).into_diagnostic()?;
+        if removed {
+            println!("removed {tool_id} from pixi.toml");
+        } else {
+            println!("{tool_id} was not present in pixi.toml");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_resolve(tool: Option<&str>, host: &HostPlatform) -> Result<()> {
+    let root = workspace_root()?;
+    let cfg = load_workspace_tools(&root).into_diagnostic()?;
+    let client = GithubClient::new();
+
+    let requests = if let Some(spec) = tool {
+        let normalized = normalize_tool_arg(spec);
+        // Prefer config entry when present so options apply; otherwise resolve the CLI spec.
+        let (id, version) = parse_tool_spec(&normalized).into_diagnostic()?;
+        if let Some(found) = cfg.tools.into_iter().find(|t| t.id == id) {
+            vec![found]
+        } else {
+            let mut request = tool_request_from_spec(
+                &normalized,
+                ConfigSource {
+                    path: root.join("pixi.toml"),
+                    table: "cli".into(),
+                },
+                ToolOptions::default(),
+            )
+            .into_diagnostic()?;
+            request.version = version;
+            vec![request]
+        }
+    } else {
+        cfg.tools
+    };
+
+    if requests.is_empty() {
+        println!("no tools to resolve");
+        return Ok(());
+    }
+
+    for request in &requests {
+        let resolved = resolve_tool(&client, request, host)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))?;
+        println!(
+            "{} @ {} ({})\n  asset: {}\n  url:   {}\n  host:  {}/{} ({})",
+            request.id.github_spec(),
+            resolved.version,
+            resolved.tag,
+            resolved.asset.name,
+            resolved.asset.download_url,
+            host.os,
+            host.arch,
+            host.pixi_platform()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ Install GitHub release binaries into Pixi-managed global or local environments �
 
 ## Status
 
-**Phase 0 (skeleton)** — Cargo workspace and `pixi-mise` CLI stubs. Subcommands parse and print a not-implemented message; GitHub resolve/install arrives in Phase 1.
+**Phase 1 (GitHub install MVP)** — Workspace `add` / `install` / `list` / `remove` resolve GitHub releases, pick a platform asset, and install binaries into `.pixi/envs/<env>/bin`. Global installs and lockfiles arrive in Phase 2.
 
 See **[DESIGN.md](./docs/DESIGN.md)** for architecture, resolution pipeline, asset matching, Pixi integration, and implementation phases.
 
@@ -32,12 +32,14 @@ Once published to a conda channel, the recommended install will be `pixi global 
 
 ## Intended usage
 
-Once Phase 1+ is implemented:
-
 ```bash
 pixi mise add github:BurntSushi/ripgrep@14
-pixi mise global add github:cli/cli
 pixi mise install
+pixi mise list
+pixi mise remove github:BurntSushi/ripgrep
+
+# Global (Phase 2)
+pixi mise global add github:cli/cli
 ```
 
 Tools are declared in `pixi.toml`:
@@ -62,10 +64,10 @@ Workspace layout:
 ```text
 crates/
   pixi-mise/          # binary → pixi-mise
-  pixi-mise-core/     # types, config, orchestration
-  pixi-mise-github/   # GitHub API (stub)
-  pixi-mise-assets/   # AssetPicker scoring (stub)
-  pixi-mise-pixi/     # Pixi prefix / global (partial)
+  pixi-mise-core/     # types, config, resolve, install
+  pixi-mise-github/   # GitHub API client
+  pixi-mise-assets/   # AssetPicker scoring
+  pixi-mise-pixi/     # Pixi prefix / metadata / bin install
 ```
 
 ## Why

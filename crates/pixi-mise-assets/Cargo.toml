@@ -9,5 +9,6 @@ rust-version.workspace = true
 description = "Mise-inspired OS/arch asset scoring for GitHub release binaries"
 
 [dependencies]
+regex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
