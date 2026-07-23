@@ -100,7 +100,7 @@ format = "tar.gz"
 supported_envs = ["linux", "darwin", "windows"]
 ```
 
-Global tools live in `$PIXI_HOME/pixi-mise.toml`:
+Global tools live in a sidecar `$PIXI_HOME/pixi-mise.toml` (separate from Pixi’s `pixi-global.toml`). Installs go under `$PIXI_HOME/envs/pixi-mise-…/bin/` and are symlinked into `$PIXI_HOME/bin` so they share the same `PATH` entry as `pixi global` tools. They will not appear in `pixi global list` — use `pixi mise global list`.
 
 ```toml
 [tools]
@@ -139,7 +139,7 @@ Pixi covers Conda/PyPI well. Many CLI tools only publish GitHub release assets. 
 - **Pixi extension model** — executable named `pixi-mise` → `pixi mise …`
 - **Mise-inspired pipeline** — discover → resolve → pick asset → install → expose
 - **AssetPicker scoring** — OS / arch / libc / archive format / penalties (mise `asset_matcher` model)
-- **Local + global targets** — `.pixi/envs/<env>/bin` and `$PIXI_HOME` global exposure
+- **Local + global targets** — `.pixi/envs/<env>/bin` and `$PIXI_HOME` global exposure via sidecar `pixi-mise.toml` (not `pixi-global.toml`)
 - **Lockfile** — `pixi-mise.lock` with sha256 for reproducible installs
 - **Registry** — aqua-registry + local TOML recipes for awkward asset names
 - **Rust workspace** — CLI + core + GitHub + assets + Pixi adapter crates
