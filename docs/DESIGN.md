@@ -174,6 +174,25 @@ rename_exe = "oxlint"
 [feature.test.dependencies]
 pytest = "*"
 
+# Auto-install pixi-mise tools when the env is activated (written by `pixi mise add`)
+[activation]
+scripts = [".pixi-mise/activate.sh"]
+
+[target.win-64.activation]
+scripts = [".pixi-mise/activate.bat"]
+
+[feature.test.activation]
+scripts = [".pixi-mise/activate.sh"]
+
+[feature.test.target.win-64.activation]
+scripts = [".pixi-mise/activate.bat"]
+
+[feature.lint.activation]
+scripts = [".pixi-mise/activate.sh"]
+
+[feature.lint.target.win-64.activation]
+scripts = [".pixi-mise/activate.bat"]
+
 [environments]
 test = { features = ["test"] }
 lint = { features = ["lint"] }
@@ -190,7 +209,7 @@ Global config lives in a **sidecar** file `$PIXI_HOME/pixi-mise.toml` (not Pixi�
 `pixi global list` will not show these tools — use `pixi mise global list`. Both systems share `$PIXI_HOME/bin` on `PATH`.
 ### 4.2 Compatibility with `mise.toml`
 
-Optionally read a subset of `mise.toml` `[tools]` entries that use the `github:` backend. Write path for v1 remains `[tool.pixi-mise]` in `pixi.toml` / `pixi-mise.toml` so Pixi-native projects have a clear home. Full bidirectional sync with mise is out of scope for v1.
+Optionally read a subset of `mise.toml` `[tools]` entries that use the `github:` backend. Write path for v1 remains `[tool.pixi-mise]` in `pixi.toml` / `pixi-mise.toml` (default tools plus `[tool.pixi-mise.feature.<name>.tools]`) so Pixi-native projects have a clear home. Full bidirectional sync with mise is out of scope for v1.
 
 ## 5. Architecture
 
@@ -379,6 +398,95 @@ On `add` / `install` / `update` / `upgrade` / `reinstall`, which tools go into w
 
 `pixi mise list --environment E` shows the resolved union for `E`. `list` without `--environment` shows tools grouped by feature.
 
+### Activation hooks (local only)
+
+Goal: a fresh clone should get GitHub tools on first `pixi shell` / `pixi run` **without** remembering `pixi mise install`.
+
+Pixi’s `[activation]` / `[feature.<name>.activation]` tables run scripts whenever an environment that includes that feature is activated. `pixi mise add` therefore also wires the matching activation table so activation installs that feature’s (env-union) tools.
+
+**What `add` writes**
+
+| Feature | Activation table | Script entry |
+|---------|------------------|--------------|
+| Default | `[activation]` (+ `[target.win-64.activation]`) | `.pixi-mise/activate.sh` / `.pixi-mise/activate.bat` |
+| Named `F` | `[feature.F.activation]` (+ win-64 target) | same shared scripts |
+
+Rules:
+
+1. **Append, don’t clobber** — if `scripts` already exists, append the pixi-mise script path only when missing; leave other user scripts untouched.
+2. **Generate committed scripts** under workspace `.pixi-mise/` (not `.pixi/`, which is typically gitignored) so clones retain them.
+3. **Idempotent install** — scripts call `pixi mise install --environment "$PIXI_ENVIRONMENT_NAME" --locked` (fall back without `--locked` if no lockfile). No-op / fast when tools are already present.
+4. **Shared script, env-aware** — one script for all features; it uses Pixi’s `PIXI_ENVIRONMENT_NAME` so the correct env’s feature-union is installed. Attaching the same script to multiple features in one env may run it more than once; that must be cheap.
+5. **First tool / last tool** — create scripts + activation entries on the first tool added to a feature; on `remove`, if that feature’s tools table becomes empty, remove only the pixi-mise-owned script path from that feature’s activation `scripts` (do not delete unrelated entries). Delete `.pixi-mise/activate.*` only when no feature still references them.
+6. **Opt-out** — `[tool.pixi-mise] activation = false` or `pixi mise add --no-activation` skips wiring hooks (still writes the tools table and installs immediately as today).
+7. **Prerequisite** — `pixi-mise` must be on the outer `PATH` (e.g. via `pixi global install pixi-mise`) because activation scripts run with the system shell before the env is fully available.
+
+**Canonical script contents**
+
+`pixi mise add` generates these files verbatim (overwrite if the managed header is present; do not overwrite a user-edited file that dropped the header). Both scripts do one thing: run an env-scoped `pixi-mise install`, preferring `--locked` when `pixi-mise.lock` exists.
+
+`.pixi-mise/activate.sh` (Unix — Pixi runs activation with `bash`):
+
+```bash
+#!/usr/bin/env bash
+# Managed by pixi-mise — do not edit (re-run `pixi mise add` to regenerate).
+# Installs GitHub release tools declared in pixi.toml into the active Pixi env.
+set -euo pipefail
+
+if ! command -v pixi-mise >/dev/null 2>&1; then
+  echo "pixi-mise: not on PATH; skip auto-install (try: pixi global install pixi-mise)" >&2
+  exit 0
+fi
+
+env_name="${PIXI_ENVIRONMENT_NAME:-default}"
+root="${PIXI_PROJECT_ROOT:-.}"
+
+if [[ -f "${root}/pixi-mise.lock" ]]; then
+  pixi-mise install --environment "${env_name}" --locked
+else
+  pixi-mise install --environment "${env_name}"
+fi
+```
+
+`.pixi-mise/activate.bat` (Windows — Pixi runs activation with `cmd.exe`):
+
+```bat
+@echo off
+REM Managed by pixi-mise — do not edit (re-run `pixi mise add` to regenerate).
+REM Installs GitHub release tools declared in pixi.toml into the active Pixi env.
+
+where pixi-mise >nul 2>nul
+if errorlevel 1 (
+  echo pixi-mise: not on PATH; skip auto-install ^(try: pixi global install pixi-mise^) 1>&2
+  exit /b 0
+)
+
+set "env_name=%PIXI_ENVIRONMENT_NAME%"
+if "%env_name%"=="" set "env_name=default"
+
+set "root=%PIXI_PROJECT_ROOT%"
+if "%root%"=="" set "root=."
+
+if exist "%root%\pixi-mise.lock" (
+  pixi-mise install --environment "%env_name%" --locked
+) else (
+  pixi-mise install --environment "%env_name%"
+)
+```
+
+Behavior summary:
+
+| Step | Behavior |
+|------|----------|
+| Missing `pixi-mise` | Warn on stderr and exit 0 (do not fail `pixi shell` / `pixi run`) |
+| Env name | `PIXI_ENVIRONMENT_NAME`, else `default` |
+| Project root | `PIXI_PROJECT_ROOT`, else `.` (for lockfile lookup) |
+| Lockfile present | `pixi-mise install --environment <env> --locked` |
+| No lockfile | `pixi-mise install --environment <env>` |
+| Already installed | `install` is idempotent / fast no-op (implementation requirement) |
+
+**Why activation scripts (not tasks)?** Tasks require an explicit `pixi run …`. Activation runs on every `pixi shell` / `pixi run`, matching “open the workspace and tools are there.” Side effects (writing into `$PREFIX/bin`) persist even though Pixi only re-exports env vars from activation scripts into the shell.
+
 ## 7. Resolution Pipeline
 
 ```text
@@ -495,7 +603,7 @@ Naming follows Pixi’s built-in commands wherever the behavior matches. Aliases
 | `pixi mise lock` | `pixi lock` | Rewrite lockfile from current resolution (no install) |
 | `pixi mise clean cache` | `pixi clean cache` | Clear download cache |
 
-Local `add` / `remove` / `upgrade` accept `--feature <name>` / `-f <name>` (default: `default`), mirroring `pixi add --feature`. That selects which `[tool.pixi-mise…tools]` table is edited (§6 Feature-scoped tools).
+Local `add` / `remove` / `upgrade` accept `--feature <name>` / `-f <name>` (default: `default`), mirroring `pixi add --feature`. That selects which `[tool.pixi-mise…tools]` table is edited (§6 Feature-scoped tools). Local `add` also wires Pixi `[activation]` / `[feature.<name>.activation]` unless `--no-activation` is passed (§6 Activation hooks).
 
 ### 10.2 Global commands
 
@@ -518,7 +626,7 @@ No direct Pixi equivalent; keep for GitHub-binary workflows:
 | `pixi mise resolve` | Show resolved assets without installing (dry-run) |
 | `pixi mise which <bin>` | Print installed binary path |
 
-Shared flags: `--environment`, `--feature` / `-f` (local manifest edits + install targeting, see §6), `--platform` (cross-resolve for lock), `--dry-run` / `-n`, `--verbose`. Prefer Pixi-style update options (`--frozen`, `--locked`, `--no-install`) where they apply.
+Shared flags: `--environment`, `--feature` / `-f` (local manifest edits + install targeting, see §6), `--no-activation` (skip wiring Pixi activation hooks on `add`), `--platform` (cross-resolve for lock), `--dry-run` / `-n`, `--verbose`. Prefer Pixi-style update options (`--frozen`, `--locked`, `--no-install`) where they apply.
 
 ## 11. Auth, Cache, Verification
 
@@ -581,6 +689,7 @@ Actionable errors, modeled on mise:
 - `--feature` / `-f` on local `add` / `remove` / `upgrade`.
 - Read/write `[tool.pixi-mise.feature.<name>.tools]`; parse `[environments]` to union tools per env (respect `no-default-feature`).
 - `FeatureName` on `ToolRequest`; install targeting per §6.
+- On local `add`, wire `[activation]` / `[feature.<name>.activation]` scripts (`.pixi-mise/activate.sh|.bat`) so `pixi shell` / `pixi run` auto-runs env-scoped `pixi mise install` (opt-out: `activation = false` / `--no-activation`). See §6 Activation hooks.
 
 ## 15. Open Questions
 
@@ -591,11 +700,13 @@ Actionable errors, modeled on mise:
 ### Resolved
 
 - **Multi-env / features** — Tools are **per-feature** in `pixi.toml` (`[tool.pixi-mise.tools]` for default; `[tool.pixi-mise.feature.<name>.tools]` for named features). `pixi mise add --feature <name>` writes the named table. Install unions tools from the features included in the selected Pixi environment (respecting `no-default-feature`). See §6.
+- **Activation auto-install** — Local `add` also ensures the corresponding Pixi activation table references `.pixi-mise/activate.sh` (and `.bat` on Windows) so activating an environment installs that env’s pixi-mise tools without a manual `pixi mise install`. See §6 Activation hooks.
 
 ## 16. Success Criteria
 
 - `pixi mise add github:BurntSushi/ripgrep@14` in a Pixi workspace makes `rg` available under `pixi run rg` / `pixi shell`.
 - `pixi mise add --feature test github:cli/cli` writes to `[tool.pixi-mise.feature.test.tools]` and installs into environments that include the `test` feature.
+- After `add`, a fresh workspace clone that activates an env (via `pixi shell` / `pixi run`) auto-installs that env’s pixi-mise tools through the wired `[activation]` / `[feature.*.activation]` scripts.
 - `pixi mise global add github:cli/cli` makes `gh` available from `$PIXI_HOME/bin`.
 - Same config resolves correct assets on `linux-64`, `osx-arm64`, and `win-64` without per-OS `asset_pattern` for well-named releases.
 - Lockfile enables bit-for-bit reproducible CI installs when checksums are present.

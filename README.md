@@ -6,7 +6,7 @@ Install GitHub release binaries into Pixi-managed global or local environments �
 
 **Phase 4 (registry)** — Aqua-registry recipes (asset templates, replacements, `supported_envs`), optional local `pixi-mise-registry.toml`, platform `os` filters, and `pixi mise registry`.
 
-**Next: Phase 5** — Feature-scoped local tools (`pixi mise add --feature …` → `[tool.pixi-mise.feature.<name>.tools]`).
+**Next: Phase 5** — Feature-scoped local tools (`pixi mise add --feature …`) plus Pixi activation hooks that auto-install on `pixi shell` / `pixi run`.
 
 See **[DESIGN.md](./docs/DESIGN.md)** for architecture, resolution pipeline, asset matching, Pixi integration, and implementation phases.
 
@@ -76,6 +76,10 @@ Version specs accept `latest`, exact tags (`14.1.1`), prefixes (`14`), caret (`^
 
 `--feature` / `-f` (local only) mirrors `pixi add --feature`: tools go into `[tool.pixi-mise.feature.<name>.tools]` instead of the default `[tool.pixi-mise.tools]`. Install unions tools from the features included in the selected Pixi environment (see DESIGN.md §6).
 
+Local `add` also wires the matching Pixi activation table (`[activation]` or `[feature.<name>.activation]`) to run `.pixi-mise/activate.sh` (and `.bat` on Windows), so `pixi shell` / `pixi run` auto-installs that environment’s pixi-mise tools on a fresh workspace. Opt out with `--no-activation` or `[tool.pixi-mise] activation = false`.
+
+The activate scripts call `pixi-mise install --environment "$PIXI_ENVIRONMENT_NAME"` (with `--locked` when `pixi-mise.lock` exists). Full canonical `.sh` / `.bat` contents are in [DESIGN.md §6](./docs/DESIGN.md#activation-hooks-local-only).
+
 When no explicit `asset_pattern` is set, resolve consults the [aqua-registry](https://github.com/aquaproj/aqua-registry) (cached under `~/.cache/pixi-mise/registry/`) and optional workspace `pixi-mise-registry.toml`. Disable with `[tool.pixi-mise] registry = false` or per-tool `registry = false`.
 
 Tools are declared in `pixi.toml`:
@@ -90,6 +94,13 @@ Tools are declared in `pixi.toml`:
 [tool.pixi-mise.feature.test.tools]
 "github:cli/cli" = "latest"
 
+# Written by `pixi mise add` so activation auto-installs tools
+[activation]
+scripts = [".pixi-mise/activate.sh"]
+
+[feature.test.activation]
+scripts = [".pixi-mise/activate.sh"]
+
 [environments]
 test = { features = ["test"] }
 ```
@@ -100,6 +111,7 @@ Optional workspace controls:
 [tool.pixi-mise]
 registry = true                    # or false / "aqua" / custom base URL
 # registry_path = "pixi-mise-registry.toml"
+activation = true                  # false to skip wiring Pixi activation hooks on add
 ```
 
 Local slim registry (`pixi-mise-registry.toml`):
