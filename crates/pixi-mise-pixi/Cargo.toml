@@ -1,0 +1,13 @@
+[package]
+name = "pixi-mise-pixi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Pixi environment, prefix, and global manifest integration for pixi-mise"
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }

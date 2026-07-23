@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pixi-mise",
+    "crates/pixi-mise-core",
+    "crates/pixi-mise-github",
+    "crates/pixi-mise-assets",
+    "crates/pixi-mise-pixi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/amirhosseindavoody/pixi-mise"
+authors = ["Amirhossein Davoody <amirhossein.davoody@gmail.com>"]
+rust-version = "1.97"
+
+[workspace.dependencies]
+pixi-mise-assets = { path = "crates/pixi-mise-assets" }
+pixi-mise-core = { path = "crates/pixi-mise-core" }
+pixi-mise-github = { path = "crates/pixi-mise-github" }
+pixi-mise-pixi = { path = "crates/pixi-mise-pixi" }
+
+clap = { version = "4.5", features = ["derive", "env"] }
+miette = { version = "7.6", features = ["fancy"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

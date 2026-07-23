@@ -1,0 +1,21 @@
+[package]
+name = "pixi-mise"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Install GitHub release binaries into Pixi environments (Pixi extension: pixi mise)"
+readme = "../../README.md"
+
+[[bin]]
+name = "pixi-mise"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+miette = { workspace = true }
+pixi-mise-core = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

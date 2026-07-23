@@ -225,7 +225,7 @@ pixi-mise/
 │   ├── pixi-mise-github/      # GitHub API client + release listing
 │   ├── pixi-mise-assets/      # AssetPicker scoring (mise-inspired)
 │   └── pixi-mise-pixi/        # Pixi env/prefix/global manifest integration
-├── DESIGN.md
+├── docs/DESIGN.md
 └── README.md
 ```
 
@@ -461,10 +461,12 @@ Actionable errors, modeled on mise:
 
 ## 14. Implementation Phases
 
-### Phase 0 — Skeleton
+### Phase 0 — Skeleton ✅
 
-- Cargo workspace, `pixi-mise` binary, clap CLI stubs.
-- Document install as Pixi extension (`PATH` / future conda package).
+- Cargo workspace, `pixi-mise` binary, clap CLI stubs for workspace + global verbs.
+- Core types (`ToolRequest`, `VersionSpec`, …) and `parse_tool_spec`.
+- Library crate stubs: `pixi-mise-github`, `pixi-mise-assets`, `pixi-mise-pixi` (prefix path helper).
+- Document install as Pixi extension (`PATH` / future conda package) in `README.md`.
 
 ### Phase 1 — GitHub install MVP
 
