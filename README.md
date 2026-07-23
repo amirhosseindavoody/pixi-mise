@@ -4,7 +4,7 @@ Install GitHub release binaries into Pixi-managed global or local environments �
 
 ## Status
 
-**Phase 1 (GitHub install MVP)** — Workspace `add` / `install` / `list` / `remove` resolve GitHub releases, pick a platform asset, and install binaries into `.pixi/envs/<env>/bin`. Global installs and lockfiles arrive in Phase 2.
+**Phase 2 (global + lockfile)** — Workspace and global `add` / `install` / `list` / `remove`, `pixi-mise.lock` with sha256 checksums, and asset overrides (`matching`, `asset_pattern`, `bin`, `rename_exe`). Search/update/upgrade polish arrives in Phase 3.
 
 See **[DESIGN.md](./docs/DESIGN.md)** for architecture, resolution pipeline, asset matching, Pixi integration, and implementation phases.
 
@@ -42,16 +42,20 @@ export PATH="$PWD/target/debug:$PATH"
 
 Once published to a conda channel, the recommended install will be `pixi global install pixi-mise`.
 
-## Intended usage
+## Usage
 
 ```bash
+# Workspace (local Pixi env)
 pixi mise add github:BurntSushi/ripgrep@14
 pixi mise install
 pixi mise list
+pixi mise lock
 pixi mise remove github:BurntSushi/ripgrep
 
-# Global (Phase 2)
+# Global ($PIXI_HOME/envs/… + expose on $PIXI_HOME/bin)
 pixi mise global add github:cli/cli
+pixi mise global list
+pixi mise global remove github:cli/cli
 ```
 
 Tools are declared in `pixi.toml`:
@@ -60,7 +64,17 @@ Tools are declared in `pixi.toml`:
 [tool.pixi-mise.tools]
 "github:BurntSushi/ripgrep" = "14.1.1"
 "github:cli/cli" = { version = "latest", matching = "gh_" }
+"github:example/tool" = { version = "1.2.3", asset_pattern = "tool-{{os}}-{{arch}}.tar.gz", rename_exe = "tool" }
 ```
+
+Global tools live in `$PIXI_HOME/pixi-mise.toml`:
+
+```toml
+[tools]
+"github:cli/cli" = { version = "latest", matching = "gh_" }
+```
+
+Installs write `pixi-mise.lock` (workspace) or `$PIXI_HOME/pixi-mise.lock` (global) with asset URL + `sha256:…`. Use `pixi mise install --locked` to reuse locked assets.
 
 ## Development
 
@@ -77,10 +91,10 @@ Workspace layout:
 ```text
 crates/
   pixi-mise/src/      # CLI binary source (package root is Cargo.toml)
-  pixi-mise-core/     # types, config, resolve, install
+  pixi-mise-core/     # types, config, resolve, install, lockfile
   pixi-mise-github/   # GitHub API client
   pixi-mise-assets/   # AssetPicker scoring
-  pixi-mise-pixi/     # Pixi prefix / metadata / bin install
+  pixi-mise-pixi/     # Pixi prefix / metadata / global expose
 ```
 
 ## Why
@@ -93,6 +107,7 @@ Pixi covers Conda/PyPI well. Many CLI tools only publish GitHub release assets. 
 - **Mise-inspired pipeline** — discover → resolve → pick asset → install → expose
 - **AssetPicker scoring** — OS / arch / libc / archive format / penalties (mise `asset_matcher` model)
 - **Local + global targets** — `.pixi/envs/<env>/bin` and `$PIXI_HOME` global exposure
+- **Lockfile** — `pixi-mise.lock` with sha256 for reproducible installs
 - **Rust workspace** — CLI + core + GitHub + assets + Pixi adapter crates
 
 ## License

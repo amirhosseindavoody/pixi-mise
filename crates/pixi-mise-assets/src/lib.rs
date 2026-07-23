@@ -97,8 +97,15 @@ pub struct PickOptions {
     pub matching: Option<String>,
     /// Regex filter on asset names.
     pub matching_regex: Option<String>,
+    /// Explicit asset pattern (glob); when set, skips OS/arch scoring.
+    ///
+    /// Supports `*`, `?`, and placeholders: `{{version}}` / `{{.Version}}`,
+    /// `{{os}}` / `{{.OS}}`, `{{arch}}` / `{{.Arch}}`.
+    pub asset_pattern: Option<String>,
     /// Prefer assets whose name starts with this tool / repo name.
     pub preferred_name: Option<String>,
+    /// Concrete version string used to expand `asset_pattern` placeholders.
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +244,11 @@ pub fn pick_asset(
     host: &HostPlatform,
     options: &PickOptions,
 ) -> Result<PickedAsset, AssetError> {
+    // `asset_pattern` replaces autodetection entirely.
+    if let Some(pattern) = options.asset_pattern.as_deref() {
+        return pick_by_asset_pattern(candidates, host, pattern, options.version.as_deref());
+    }
+
     let names: Vec<&AssetCandidate> =
         if options.matching.is_none() && options.matching_regex.is_none() {
             candidates.iter().collect()
@@ -275,6 +287,94 @@ pub fn pick_asset(
         download_url: candidate.download_url.clone(),
         size: candidate.size,
     })
+}
+
+fn pick_by_asset_pattern(
+    candidates: &[AssetCandidate],
+    host: &HostPlatform,
+    pattern: &str,
+    version: Option<&str>,
+) -> Result<PickedAsset, AssetError> {
+    let expanded = expand_asset_pattern(pattern, host, version);
+    let mut matches: Vec<&AssetCandidate> = candidates
+        .iter()
+        .filter(|c| glob_match(&expanded, &c.name))
+        .collect();
+    if matches.is_empty() {
+        return Err(AssetError::NoMatch);
+    }
+    matches.sort_by(|a, b| {
+        a.name
+            .len()
+            .cmp(&b.name.len())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let candidate = matches[0];
+    Ok(PickedAsset {
+        name: candidate.name.clone(),
+        score: 1000,
+        download_url: candidate.download_url.clone(),
+        size: candidate.size,
+    })
+}
+
+/// Expand mise/aqua-style placeholders in an asset pattern.
+pub fn expand_asset_pattern(pattern: &str, host: &HostPlatform, version: Option<&str>) -> String {
+    let os = match host.os.as_str() {
+        "macos" => "darwin",
+        other => other,
+    };
+    let arch = match host.arch.as_str() {
+        "x64" => "amd64",
+        "arm64" => "arm64",
+        "x86" => "386",
+        other => other,
+    };
+    let arch_alt = match host.arch.as_str() {
+        "x64" => "x86_64",
+        "arm64" => "aarch64",
+        other => other,
+    };
+    let ver = version.unwrap_or("*");
+    pattern
+        .replace("{{.Version}}", ver)
+        .replace("{{version}}", ver)
+        .replace("{{.OS}}", os)
+        .replace("{{os}}", os)
+        .replace("{{.Arch}}", arch)
+        .replace("{{arch}}", arch)
+        .replace("{{arch_alt}}", arch_alt)
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    glob_match_rec(pattern.as_bytes(), text.as_bytes())
+}
+
+fn glob_match_rec(pattern: &[u8], text: &[u8]) -> bool {
+    let mut pi = 0;
+    let mut ti = 0;
+    let mut star_p: Option<usize> = None;
+    let mut star_t: usize = 0;
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == b'?' || pattern[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == b'*' {
+            star_p = Some(pi);
+            star_t = ti;
+            pi += 1;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pattern.len()
 }
 
 fn apply_matching_filter<'a>(
@@ -640,6 +740,35 @@ mod tests {
         ]);
         let picked = pick_asset(&assets, &linux_x64(), &PickOptions::default()).unwrap();
         assert_eq!(picked.name, "tool-linux-x64.tar.gz");
+    }
+
+    #[test]
+    fn asset_pattern_skips_scoring() {
+        let assets = candidates(&[
+            "app-linux-amd64.tar.gz",
+            "app-custom-weird-name.zip",
+            "app-darwin-arm64.tar.gz",
+        ]);
+        let picked = pick_asset(
+            &assets,
+            &linux_x64(),
+            &PickOptions {
+                asset_pattern: Some("app-custom-*.zip".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(picked.name, "app-custom-weird-name.zip");
+    }
+
+    #[test]
+    fn asset_pattern_expands_placeholders() {
+        let expanded = expand_asset_pattern(
+            "gh_{{.Version}}_linux_{{.Arch}}.tar.gz",
+            &linux_x64(),
+            Some("2.67.0"),
+        );
+        assert_eq!(expanded, "gh_2.67.0_linux_amd64.tar.gz");
     }
 
     #[test]

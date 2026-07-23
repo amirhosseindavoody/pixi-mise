@@ -259,6 +259,116 @@ pub fn remove_tool_from_pixi_toml(pixi_toml: &Path, id: &ToolId) -> Result<bool,
     Ok(removed)
 }
 
+/// Loaded global tool configuration (`$PIXI_HOME/pixi-mise.toml`).
+#[derive(Debug, Clone)]
+pub struct GlobalConfig {
+    /// Path to the global config file.
+    pub path: PathBuf,
+    /// Declared tools.
+    pub tools: Vec<ToolRequest>,
+}
+
+/// Load `[tools]` from `$PIXI_HOME/pixi-mise.toml` (empty if missing).
+pub fn load_global_tools() -> Result<GlobalConfig, CoreError> {
+    let path = pixi_mise_pixi::global_config_path();
+    if !path.is_file() {
+        return Ok(GlobalConfig {
+            path,
+            tools: Vec::new(),
+        });
+    }
+    let text = fs::read_to_string(&path).map_err(|e| CoreError::Config(e.to_string()))?;
+    let value: Value = text
+        .parse()
+        .map_err(|e| CoreError::Config(format!("parse global config: {e}")))?;
+    let tools = parse_global_tools_table(&value, &path)?;
+    Ok(GlobalConfig { path, tools })
+}
+
+fn parse_global_tools_table(doc: &Value, path: &Path) -> Result<Vec<ToolRequest>, CoreError> {
+    let Some(tools) = doc.get("tools") else {
+        return Ok(Vec::new());
+    };
+    let table = tools
+        .as_table()
+        .ok_or_else(|| CoreError::Config("`tools` must be a table in global config".into()))?;
+    let source = ConfigSource {
+        path: path.to_path_buf(),
+        table: "tools".into(),
+    };
+    let mut out = Vec::new();
+    for (key, val) in table {
+        let (id, default_version) = parse_tool_spec(key)?;
+        let (version, options) = parse_tool_value(val, default_version)?;
+        out.push(ToolRequest {
+            backend: crate::BackendKind::Github,
+            id,
+            version,
+            options,
+            source: source.clone(),
+        });
+    }
+    out.sort_by_key(|a| a.id.as_str());
+    Ok(out)
+}
+
+/// Add or update a tool in `$PIXI_HOME/pixi-mise.toml`.
+pub fn add_tool_to_global_config(
+    id: &ToolId,
+    version: &VersionSpec,
+    options: &ToolOptions,
+) -> Result<PathBuf, CoreError> {
+    let path = pixi_mise_pixi::global_config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| CoreError::Config(e.to_string()))?;
+    }
+    let mut doc: Value = if path.is_file() {
+        let text = fs::read_to_string(&path).map_err(|e| CoreError::Config(e.to_string()))?;
+        text.parse()
+            .map_err(|e| CoreError::Config(format!("parse global config: {e}")))?
+    } else {
+        Value::Table(Default::default())
+    };
+
+    let tools = doc
+        .as_table_mut()
+        .ok_or_else(|| CoreError::Config("global config root must be a table".into()))?
+        .entry("tools")
+        .or_insert_with(|| Value::Table(Default::default()));
+    let tools_table = tools
+        .as_table_mut()
+        .ok_or_else(|| CoreError::Config("`tools` must be a table".into()))?;
+    tools_table.insert(id.github_spec(), tool_value_for_write(version, options));
+
+    let rendered = toml::to_string_pretty(&doc).map_err(|e| CoreError::Config(e.to_string()))?;
+    fs::write(&path, rendered).map_err(|e| CoreError::Config(e.to_string()))?;
+    Ok(path)
+}
+
+/// Remove a tool from `$PIXI_HOME/pixi-mise.toml`.
+pub fn remove_tool_from_global_config(id: &ToolId) -> Result<bool, CoreError> {
+    let path = pixi_mise_pixi::global_config_path();
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(&path).map_err(|e| CoreError::Config(e.to_string()))?;
+    let mut doc: Value = text
+        .parse()
+        .map_err(|e| CoreError::Config(format!("parse global config: {e}")))?;
+    let key = id.github_spec();
+    let removed = doc
+        .get_mut("tools")
+        .and_then(|t| t.as_table_mut())
+        .map(|tools| tools.remove(&key).is_some())
+        .unwrap_or(false);
+    if removed {
+        let rendered =
+            toml::to_string_pretty(&doc).map_err(|e| CoreError::Config(e.to_string()))?;
+        fs::write(&path, rendered).map_err(|e| CoreError::Config(e.to_string()))?;
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

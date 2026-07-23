@@ -12,6 +12,5 @@
 *.swp
 .DS_Store
 
-# pixi-mise runtime (future)
-pixi-mise.lock
+# Built conda packages
 dist/
