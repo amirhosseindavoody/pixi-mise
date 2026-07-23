@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use toml::Value;
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, value};
 
 use crate::registry::RegistrySettings;
 use crate::{
@@ -235,6 +236,10 @@ fn parse_version_string(raw: &str) -> VersionSpec {
 }
 
 /// Add or update a tool entry in `pixi.toml`.
+///
+/// Uses `toml_edit` so existing key order, comments, and formatting are preserved.
+/// New `[tool.pixi-mise.tools]` tables are appended; existing tables only gain/replace
+/// the tool key.
 pub fn add_tool_to_pixi_toml(
     pixi_toml: &Path,
     id: &ToolId,
@@ -242,37 +247,132 @@ pub fn add_tool_to_pixi_toml(
     options: &ToolOptions,
 ) -> Result<(), CoreError> {
     let text = fs::read_to_string(pixi_toml).map_err(|e| CoreError::Config(e.to_string()))?;
-    let mut doc: Value = text
+    let mut doc: DocumentMut = text
         .parse()
         .map_err(|e| CoreError::Config(format!("parse pixi.toml: {e}")))?;
 
-    let tool = doc
-        .as_table_mut()
-        .ok_or_else(|| CoreError::Config("pixi.toml root must be a table".into()))?
-        .entry("tool")
-        .or_insert_with(|| Value::Table(Default::default()));
-    let tool_table = tool
-        .as_table_mut()
-        .ok_or_else(|| CoreError::Config("`tool` must be a table".into()))?;
-    let pixi_mise = tool_table
-        .entry("pixi-mise")
-        .or_insert_with(|| Value::Table(Default::default()));
-    let pixi_mise_table = pixi_mise
-        .as_table_mut()
-        .ok_or_else(|| CoreError::Config("`tool.pixi-mise` must be a table".into()))?;
-    let tools = pixi_mise_table
-        .entry("tools")
-        .or_insert_with(|| Value::Table(Default::default()));
-    let tools_table = tools
-        .as_table_mut()
-        .ok_or_else(|| CoreError::Config("`tool.pixi-mise.tools` must be a table".into()))?;
+    let tools = ensure_dotted_table(&mut doc, &["tool", "pixi-mise", "tools"])?;
+    let key = id.github_spec();
+    tools[key.as_str()] = tool_item_for_write(version, options);
+
+    fs::write(pixi_toml, doc.to_string()).map_err(|e| CoreError::Config(e.to_string()))?;
+    Ok(())
+}
+
+/// Ensure `a.b.c` exists as an explicit table chain, creating missing parents as needed.
+fn ensure_dotted_table<'a>(
+    doc: &'a mut DocumentMut,
+    path: &[&str],
+) -> Result<&'a mut Table, CoreError> {
+    // Walk/create intermediate tables via Item indexing, then return the leaf.
+    {
+        let mut item = doc.as_item_mut();
+        for (i, key) in path.iter().enumerate() {
+            let is_leaf = i + 1 == path.len();
+            if item.get(key).is_none() {
+                let mut table = Table::new();
+                // Leaf should render as `[tool.pixi-mise.tools]`; intermediates stay implicit.
+                if !is_leaf {
+                    table.set_implicit(true);
+                }
+                item[key] = Item::Table(table);
+            } else if !item[key].is_table() && !item[key].is_none() {
+                return Err(CoreError::Config(format!(
+                    "`{}` must be a table",
+                    path[..=i].join(".")
+                )));
+            }
+            item = &mut item[key];
+        }
+    }
+
+    let mut item = doc.as_item_mut();
+    for key in path {
+        item = &mut item[key];
+    }
+    item.as_table_mut()
+        .ok_or_else(|| CoreError::Config(format!("`{}` must be a table", path.join("."))))
+}
+
+fn tool_item_for_write(version: &VersionSpec, options: &ToolOptions) -> Item {
+    let has_options = options.matching.is_some()
+        || options.matching_regex.is_some()
+        || options.asset_pattern.is_some()
+        || options.bin.is_some()
+        || options.rename_exe.is_some()
+        || options.version_prefix.is_some()
+        || options.prerelease
+        || options.expose_as.is_some()
+        || options.registry.is_some()
+        || !options.os.is_empty();
+
+    if !has_options {
+        return value(version.to_config_string());
+    }
+
+    let mut table = InlineTable::new();
+    table.insert(
+        "version",
+        value(version.to_config_string()).into_value().unwrap(),
+    );
+    if let Some(m) = &options.matching {
+        table.insert("matching", value(m.as_str()).into_value().unwrap());
+    }
+    if let Some(m) = &options.matching_regex {
+        table.insert("matching_regex", value(m.as_str()).into_value().unwrap());
+    }
+    if let Some(m) = &options.asset_pattern {
+        table.insert("asset_pattern", value(m.as_str()).into_value().unwrap());
+    }
+    if let Some(m) = &options.bin {
+        table.insert("bin", value(m.as_str()).into_value().unwrap());
+    }
+    if let Some(m) = &options.rename_exe {
+        table.insert("rename_exe", value(m.as_str()).into_value().unwrap());
+    }
+    if let Some(m) = &options.version_prefix {
+        table.insert("version_prefix", value(m.as_str()).into_value().unwrap());
+    }
+    if options.prerelease {
+        table.insert("prerelease", value(true).into_value().unwrap());
+    }
+    if let Some(m) = &options.expose_as {
+        table.insert("expose_as", value(m.as_str()).into_value().unwrap());
+    }
+    if let Some(b) = options.registry {
+        table.insert("registry", value(b).into_value().unwrap());
+    }
+    if !options.os.is_empty() {
+        let mut arr = Array::new();
+        for os in &options.os {
+            arr.push(os.as_str());
+        }
+        table.insert("os", toml_edit::Value::Array(arr));
+    }
+    Item::Value(toml_edit::Value::InlineTable(table))
+}
+
+/// Remove a tool entry from `pixi.toml` without rewriting unrelated content.
+pub fn remove_tool_from_pixi_toml(pixi_toml: &Path, id: &ToolId) -> Result<bool, CoreError> {
+    let text = fs::read_to_string(pixi_toml).map_err(|e| CoreError::Config(e.to_string()))?;
+    let mut doc: DocumentMut = text
+        .parse()
+        .map_err(|e| CoreError::Config(format!("parse pixi.toml: {e}")))?;
 
     let key = id.github_spec();
-    tools_table.insert(key, tool_value_for_write(version, options));
-
-    let rendered = toml::to_string_pretty(&doc).map_err(|e| CoreError::Config(e.to_string()))?;
-    fs::write(pixi_toml, rendered).map_err(|e| CoreError::Config(e.to_string()))?;
-    Ok(())
+    let Some(tools) = doc
+        .get_mut("tool")
+        .and_then(|t| t.get_mut("pixi-mise"))
+        .and_then(|t| t.get_mut("tools"))
+        .and_then(|t| t.as_table_like_mut())
+    else {
+        return Ok(false);
+    };
+    let removed = tools.remove(&key).is_some();
+    if removed {
+        fs::write(pixi_toml, doc.to_string()).map_err(|e| CoreError::Config(e.to_string()))?;
+    }
+    Ok(removed)
 }
 
 fn tool_value_for_write(version: &VersionSpec, options: &ToolOptions) -> Value {
@@ -327,30 +427,6 @@ fn tool_value_for_write(version: &VersionSpec, options: &ToolOptions) -> Value {
         );
     }
     Value::Table(table)
-}
-
-/// Remove a tool entry from `pixi.toml`.
-pub fn remove_tool_from_pixi_toml(pixi_toml: &Path, id: &ToolId) -> Result<bool, CoreError> {
-    let text = fs::read_to_string(pixi_toml).map_err(|e| CoreError::Config(e.to_string()))?;
-    let mut doc: Value = text
-        .parse()
-        .map_err(|e| CoreError::Config(format!("parse pixi.toml: {e}")))?;
-
-    let key = id.github_spec();
-    let removed = doc
-        .get_mut("tool")
-        .and_then(|t| t.get_mut("pixi-mise"))
-        .and_then(|t| t.get_mut("tools"))
-        .and_then(|t| t.as_table_mut())
-        .map(|tools| tools.remove(&key).is_some())
-        .unwrap_or(false);
-
-    if removed {
-        let rendered =
-            toml::to_string_pretty(&doc).map_err(|e| CoreError::Config(e.to_string()))?;
-        fs::write(pixi_toml, rendered).map_err(|e| CoreError::Config(e.to_string()))?;
-    }
-    Ok(removed)
 }
 
 /// Loaded global tool configuration (`$PIXI_HOME/pixi-mise.toml`).
@@ -597,6 +673,88 @@ name = "demo"
         assert!(remove_tool_from_pixi_toml(&toml_path, &id).unwrap());
         let cfg = load_workspace_tools(&root).unwrap();
         assert!(cfg.tools.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn add_tool_preserves_existing_pixi_toml_order() {
+        let original = r#"# keep this comment
+[workspace]
+name = "demo"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+
+[tasks]
+hello = "echo hi"
+"#;
+        let root = temp_workspace(original);
+        let toml_path = root.join("pixi.toml");
+        let id = ToolId {
+            owner: "BurntSushi".into(),
+            repo: "ripgrep".into(),
+        };
+        add_tool_to_pixi_toml(
+            &toml_path,
+            &id,
+            &VersionSpec::Prefix("14".into()),
+            &ToolOptions::default(),
+        )
+        .unwrap();
+        let updated = fs::read_to_string(&toml_path).unwrap();
+        assert!(
+            updated.starts_with("# keep this comment\n[workspace]\nname = \"demo\""),
+            "prefix/order changed:\n{updated}"
+        );
+        assert!(
+            updated.contains("[dependencies]\npython = \"3.12.*\""),
+            "dependencies reordered:\n{updated}"
+        );
+        assert!(
+            updated.contains("[tasks]\nhello = \"echo hi\""),
+            "tasks missing/reordered:\n{updated}"
+        );
+        assert!(
+            updated.contains("[tool.pixi-mise.tools]"),
+            "tools section missing:\n{updated}"
+        );
+        assert!(
+            updated.contains("\"github:BurntSushi/ripgrep\" = \"14\""),
+            "tool entry missing:\n{updated}"
+        );
+        // Existing sections should still appear before the newly appended tools table.
+        let deps_at = updated.find("[dependencies]").unwrap();
+        let tools_at = updated.find("[tool.pixi-mise.tools]").unwrap();
+        assert!(deps_at < tools_at, "tools section was not appended:\n{updated}");
+
+        // Second add should only append to the tools table.
+        let id2 = ToolId {
+            owner: "cli".into(),
+            repo: "cli".into(),
+        };
+        add_tool_to_pixi_toml(
+            &toml_path,
+            &id2,
+            &VersionSpec::Latest,
+            &ToolOptions {
+                matching: Some("gh_".into()),
+                ..ToolOptions::default()
+            },
+        )
+        .unwrap();
+        let updated2 = fs::read_to_string(&toml_path).unwrap();
+        assert_eq!(
+            updated2.matches("[tool.pixi-mise.tools]").count(),
+            1,
+            "duplicate tools headers:\n{updated2}"
+        );
+        assert!(updated2.contains("\"github:cli/cli\""));
+        assert!(
+            updated2.starts_with("# keep this comment\n[workspace]\nname = \"demo\""),
+            "second add rewrote file:\n{updated2}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

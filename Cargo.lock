@@ -994,6 +994,7 @@ dependencies = [
  "tar",
  "thiserror",
  "toml",
+ "toml_edit",
  "tracing",
  "xz2",
  "zip",
