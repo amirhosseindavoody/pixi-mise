@@ -180,21 +180,30 @@ pub fn install_tool(
     write_tool_meta(&meta_root, env, &meta)?;
 
     // Update lockfile next to the install scope.
-    let lock_path = match target {
-        InstallTarget::Local { workspace_root, .. } => Lockfile::workspace_path(workspace_root),
-        InstallTarget::Global { .. } => Lockfile::global_path(&pixi_mise_pixi::pixi_home()),
+    let (lock_path, lock_env) = match target {
+        InstallTarget::Local {
+            workspace_root,
+            env,
+        } => (Lockfile::workspace_path(workspace_root), env.as_str()),
+        InstallTarget::Global { env } => (
+            Lockfile::global_path(&pixi_mise_pixi::pixi_home()),
+            env.as_str(),
+        ),
     };
     let mut lock = Lockfile::load(&lock_path)?;
-    lock.upsert(LockEntry {
-        id: tool_id,
-        version: tool.version.clone(),
-        tag: tool.tag.clone(),
-        asset: tool.asset.name.clone(),
-        url: tool.asset.download_url.clone(),
-        checksum: checksum.clone(),
-        platform: host.pixi_platform(),
-        installed_bins: installed_bins.clone(),
-    });
+    lock.upsert(
+        lock_env,
+        LockEntry {
+            id: tool_id,
+            version: tool.version.clone(),
+            tag: tool.tag.clone(),
+            asset: tool.asset.name.clone(),
+            url: tool.asset.download_url.clone(),
+            checksum: checksum.clone(),
+            platform: host.pixi_platform(),
+            installed_bins: installed_bins.clone(),
+        },
+    );
     lock.save(&lock_path)?;
 
     let _ = fs::remove_dir_all(&staging);

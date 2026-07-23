@@ -510,23 +510,47 @@ ToolRequest
 
 ### Lockfile (`pixi-mise.lock`)
 
-Record per tool + platform:
+Schema mirrors [`pixi.lock`](https://pixi.prefix.dev/latest/workspace/lock_file/): YAML with a schema `version`, per-environment package refs, and a deduplicated `packages` table keyed by download URL. Legacy TOML `[[tools]]` files are migrated on load.
 
-```toml
-[[tools]]
-id = "github:BurntSushi/ripgrep"
-version = "14.1.1"
-tag = "14.1.1"
-asset = "ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz"
-url = "https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/..."
-checksum = "sha256:…"
-platform = "linux-64"
-installed_bins = ["rg"]
+```yaml
+version: 1
+platforms:
+- name: linux-64
+environments:
+  default:
+    packages:
+      linux-64:
+      - github: https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz
+  test:
+    packages:
+      linux-64:
+      - github: https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_linux_amd64.tar.gz
+packages:
+- github: https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz
+  id: github:BurntSushi/ripgrep
+  version: 14.1.1
+  tag: 14.1.1
+  asset: ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz
+  subdir: linux-64
+  sha256: …
+  bins:
+  - rg
+- github: https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_linux_amd64.tar.gz
+  id: github:cli/cli
+  version: 2.67.0
+  tag: v2.67.0
+  asset: gh_2.67.0_linux_amd64.tar.gz
+  subdir: linux-64
+  sha256: …
+  bins:
+  - gh
 ```
 
-Install prefers lockfile URL/checksum when present and still valid; `pixi mise lock` / `install --update-lock` refreshes.
+Install prefers lockfile URL/checksum when present and still valid; `pixi mise lock` / `install --update-lock` refreshes. Lookups are per `(environment, platform, id)`.
 
-Lock keys remain `(id, platform)`. If the same tool id appears in multiple features that end up in one environment with **conflicting** version/options, `install` errors and asks the user to dedupe. Identical specs across features are fine (install once).
+Package identity is the download URL (like pixi's `conda: <url>` refs). `sha256` is stored as bare hex (pixi-style), not `sha256:…`.
+
+If the same tool id appears in multiple features that end up in one environment with **conflicting** version/options, `install` errors and asks the user to dedupe. Identical specs across features are fine (one package record, multiple env refs).
 
 ## 8. Asset Matching Design
 

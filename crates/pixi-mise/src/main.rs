@@ -324,14 +324,19 @@ fn resolve_request(
     lock_path: &std::path::Path,
     use_lock: bool,
     registry: &RegistrySettings,
+    environment: &str,
 ) -> Result<pixi_mise_core::ToolVersion> {
     let lock = Lockfile::load(lock_path).into_diagnostic()?;
     let entry = if use_lock {
-        lock.find(&request.id.github_spec(), &host.pixi_platform())
+        lock.find(
+            environment,
+            &request.id.github_spec(),
+            &host.pixi_platform(),
+        )
     } else {
         None
     };
-    resolve_tool_with_settings(client, request, host, entry, registry)
+    resolve_tool_with_settings(client, request, host, entry.as_ref(), registry)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))
 }
@@ -407,14 +412,6 @@ fn cmd_add(
     let client = GithubClient::new();
     let lock_path = Lockfile::workspace_path(&root);
     let registry = registry_for_workspace(&root);
-    let resolved = resolve_request(&client, &request, host, &lock_path, locked, &registry)?;
-    println!(
-        "resolved {} @ {} → {}",
-        request.id.github_spec(),
-        resolved.tag,
-        resolved.asset.name
-    );
-
     let cfg = load_workspace_tools(&root).into_diagnostic()?;
     let targets: Vec<String> = if let Some(env) = environment {
         vec![env.to_string()]
@@ -429,6 +426,18 @@ fn cmd_add(
         }
         envs
     };
+
+    // Resolve against the first target env's lock pin when --locked.
+    let lock_env = targets.first().map(String::as_str).unwrap_or("default");
+    let resolved = resolve_request(
+        &client, &request, host, &lock_path, locked, &registry, lock_env,
+    )?;
+    println!(
+        "resolved {} @ {} → {}",
+        request.id.github_spec(),
+        resolved.tag,
+        resolved.asset.name
+    );
 
     for env in targets {
         let target = InstallTarget::Local {
@@ -476,12 +485,12 @@ fn cmd_install(
     let client = GithubClient::new();
     let lock_path = Lockfile::workspace_path(&root);
     for request in &requests {
-        let resolved = match resolve_request(&client, request, host, &lock_path, locked, &registry)
-        {
-            Ok(r) => r,
-            Err(err) if skip_unsupported(&err, &request.id.github_spec()) => continue,
-            Err(err) => return Err(err),
-        };
+        let resolved =
+            match resolve_request(&client, request, host, &lock_path, locked, &registry, env) {
+                Ok(r) => r,
+                Err(err) if skip_unsupported(&err, &request.id.github_spec()) => continue,
+                Err(err) => return Err(err),
+            };
         println!(
             "resolved {} @ {} → {}",
             request.id.github_spec(),
@@ -670,8 +679,9 @@ fn cmd_resolve(tool: Option<&str>, host: &HostPlatform, locked: bool) -> Result<
     }
 
     for request in &requests {
-        let resolved = match resolve_request(&client, request, host, &lock_path, locked, &registry)
-        {
+        let resolved = match resolve_request(
+            &client, request, host, &lock_path, locked, &registry, "default",
+        ) {
             Ok(r) => r,
             Err(err) if skip_unsupported(&err, &request.id.github_spec()) => continue,
             Err(err) => return Err(err),
@@ -698,47 +708,62 @@ fn cmd_lock(host: &HostPlatform) -> Result<()> {
     let root = workspace_root()?;
     let cfg = load_workspace_tools(&root).into_diagnostic()?;
     if cfg.tools.is_empty() {
-        println!("no tools configured under [tool.pixi-mise.tools]");
+        println!("no pixi-mise tools configured");
         return Ok(());
     }
     let client = GithubClient::new();
     let lock_path = Lockfile::workspace_path(&root);
     let registry = cfg.registry.clone();
     let mut lock = Lockfile::default();
-    for request in &cfg.tools {
-        // Fresh resolve (ignore existing lock) so `lock` refreshes pins.
-        let resolved = match resolve_tool_with_settings(&client, request, host, None, &registry) {
-            Ok(r) => r,
-            Err(pixi_mise_core::CoreError::UnsupportedPlatform {
-                tool,
-                platform,
-                reason,
-            }) => {
-                println!("skipping {tool}: not supported on {platform} ({reason})");
-                continue;
-            }
-            Err(err) => {
-                return Err(err)
-                    .into_diagnostic()
-                    .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()));
-            }
-        };
-        println!(
-            "locked {} @ {} → {}",
-            request.id.github_spec(),
-            resolved.tag,
-            resolved.asset.name
-        );
-        lock.upsert(pixi_mise_core::LockEntry {
-            id: request.id.github_spec(),
-            version: resolved.version.clone(),
-            tag: resolved.tag.clone(),
-            asset: resolved.asset.name.clone(),
-            url: resolved.asset.download_url.clone(),
-            checksum: resolved.asset.digest.clone(),
-            platform: host.pixi_platform(),
-            installed_bins: Vec::new(),
-        });
+
+    let mut env_names: Vec<String> = cfg.environments.keys().cloned().collect();
+    if !env_names.iter().any(|n| n == "default") {
+        env_names.push("default".into());
+    }
+    env_names.sort();
+    env_names.dedup();
+
+    for env_name in &env_names {
+        let requests = tools_for_environment(&cfg, env_name).into_diagnostic()?;
+        for request in &requests {
+            // Fresh resolve (ignore existing lock) so `lock` refreshes pins.
+            let resolved = match resolve_tool_with_settings(&client, request, host, None, &registry)
+            {
+                Ok(r) => r,
+                Err(pixi_mise_core::CoreError::UnsupportedPlatform {
+                    tool,
+                    platform,
+                    reason,
+                }) => {
+                    println!("skipping {tool}: not supported on {platform} ({reason})");
+                    continue;
+                }
+                Err(err) => {
+                    return Err(err).into_diagnostic().wrap_err_with(|| {
+                        format!("failed to resolve {}", request.id.github_spec())
+                    });
+                }
+            };
+            println!(
+                "locked {} @ {} → {} [{env_name}]",
+                request.id.github_spec(),
+                resolved.tag,
+                resolved.asset.name
+            );
+            lock.upsert(
+                env_name,
+                pixi_mise_core::LockEntry {
+                    id: request.id.github_spec(),
+                    version: resolved.version.clone(),
+                    tag: resolved.tag.clone(),
+                    asset: resolved.asset.name.clone(),
+                    url: resolved.asset.download_url.clone(),
+                    checksum: resolved.asset.digest.clone(),
+                    platform: host.pixi_platform(),
+                    installed_bins: Vec::new(),
+                },
+            );
+        }
     }
     lock.save(&lock_path).into_diagnostic()?;
     println!("wrote {}", lock_path.display());
@@ -789,7 +814,7 @@ fn cmd_global_add(
     let client = GithubClient::new();
     let lock_path = Lockfile::global_path(&pixi_home());
     let registry = RegistrySettings::default();
-    let resolved = resolve_request(&client, &request, host, &lock_path, locked, &registry)?;
+    let resolved = resolve_request(&client, &request, host, &lock_path, locked, &registry, &env)?;
     println!(
         "resolved {} @ {} → {}",
         request.id.github_spec(),
@@ -842,12 +867,12 @@ fn cmd_global_install(
         let env = environment
             .map(str::to_string)
             .unwrap_or_else(|| global_env_name(&request.id.github_spec()));
-        let resolved = match resolve_request(&client, request, host, &lock_path, locked, &registry)
-        {
-            Ok(r) => r,
-            Err(err) if skip_unsupported(&err, &request.id.github_spec()) => continue,
-            Err(err) => return Err(err),
-        };
+        let resolved =
+            match resolve_request(&client, request, host, &lock_path, locked, &registry, &env) {
+                Ok(r) => r,
+                Err(err) if skip_unsupported(&err, &request.id.github_spec()) => continue,
+                Err(err) => return Err(err),
+            };
         println!(
             "resolved {} @ {} → {}",
             request.id.github_spec(),
@@ -1194,7 +1219,7 @@ fn cmd_reinstall(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bo
         if let Some(meta) = read_tool_meta(&meta_root, env, &tool_id).into_diagnostic()? {
             invalidate_cached_asset(&request.id.owner, &request.id.repo, &meta.tag, &meta.asset)
                 .into_diagnostic()?;
-        } else if let Some(entry) = lock.find(&tool_id, &host.pixi_platform()) {
+        } else if let Some(entry) = lock.find_by_id_platform(&tool_id, &host.pixi_platform()) {
             invalidate_cached_asset(
                 &request.id.owner,
                 &request.id.repo,
