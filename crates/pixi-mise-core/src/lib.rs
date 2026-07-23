@@ -5,6 +5,7 @@
 mod config;
 mod extract;
 mod install;
+mod lockfile;
 mod resolve;
 
 use std::path::PathBuf;
@@ -16,11 +17,13 @@ pub use pixi_mise_github as github;
 pub use pixi_mise_pixi as pixi;
 
 pub use config::{
-    WorkspaceConfig, add_tool_to_pixi_toml, find_workspace_root, load_workspace_tools,
+    GlobalConfig, WorkspaceConfig, add_tool_to_global_config, add_tool_to_pixi_toml,
+    find_workspace_root, load_global_tools, load_workspace_tools, remove_tool_from_global_config,
     remove_tool_from_pixi_toml,
 };
-pub use install::{InstallOutcome, install_tool};
-pub use resolve::resolve_tool;
+pub use install::{InstallOutcome, install_tool, install_tool_local};
+pub use lockfile::{LockEntry, Lockfile, sha256_file, verify_sha256};
+pub use resolve::{resolve_tool, resolve_tool_with_lock};
 
 /// Errors from core orchestration.
 #[derive(Debug, Error)]

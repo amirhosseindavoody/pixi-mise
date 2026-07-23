@@ -475,7 +475,7 @@ Actionable errors, modeled on mise:
 - Resolve latest/exact/prefix; AssetPicker autodetection.
 - Install into local env `bin/`; `add` / `install` / `list` / `remove`.
 
-### Phase 2 — Global + lockfile
+### Phase 2 — Global + lockfile ✅
 
 - `pixi mise global …` path + `$PIXI_HOME/bin` exposure.
 - `pixi-mise.lock` with checksums.
@@ -494,10 +494,10 @@ Actionable errors, modeled on mise:
 
 ## 15. Open Questions
 
-1. **Global exposure API** — Prefer linking into `$PIXI_HOME/bin` directly vs. editing `pixi-global.toml` if a stable schema/API is available.
-2. **Lockfile location** — Commit `pixi-mise.lock` beside `pixi.lock`, or nest under `.pixi/`?
+1. **Global exposure API** — v1 uses symlinks into `$PIXI_HOME/bin` plus `$PIXI_HOME/pixi-mise.toml`. Revisit editing `pixi-global.toml` if a stable schema/API appears.
+2. **Lockfile location** — Workspace: commit `pixi-mise.lock` beside `pixi.lock`. Global: `$PIXI_HOME/pixi-mise.lock`.
 3. **Upgrade policy for `latest`** — Pin on first install (lockfile); bump within constraints on `update`, loosen manifest specs on `upgrade` (Pixi semantics).
-4. **Windows shims** — Copy `.exe` vs. generate `.cmd` wrappers when exposing globally.
+4. **Windows shims** — Copy `.exe` vs. generate `.cmd` wrappers when exposing globally (currently copy on non-Unix).
 5. **Multi-env workspaces** — Should tools be per-feature/per-environment in `pixi.toml`, or always default env unless flagged?
 
 ## 16. Success Criteria

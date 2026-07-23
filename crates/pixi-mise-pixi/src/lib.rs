@@ -1,4 +1,4 @@
-//! Pixi environment, prefix, and binary install helpers.
+//! Pixi environment, prefix, global expose, and binary install helpers.
 
 #![deny(missing_docs)]
 
@@ -20,9 +20,6 @@ pub enum PixiError {
     /// I/O failure.
     #[error("I/O error: {0}")]
     Io(String),
-    /// Feature not implemented yet.
-    #[error("{0} is not implemented yet")]
-    NotImplemented(&'static str),
 }
 
 /// Where binaries should be installed.
@@ -42,6 +39,23 @@ pub enum InstallTarget {
     },
 }
 
+impl InstallTarget {
+    /// Environment name for this target.
+    pub fn env_name(&self) -> &str {
+        match self {
+            Self::Local { env, .. } | Self::Global { env } => env,
+        }
+    }
+
+    /// Metadata root directory (workspace `.pixi` or `$PIXI_HOME`).
+    pub fn meta_root(&self) -> PathBuf {
+        match self {
+            Self::Local { workspace_root, .. } => workspace_root.join(".pixi"),
+            Self::Global { .. } => pixi_home(),
+        }
+    }
+}
+
 /// Metadata recorded for an installed tool (list / remove).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstalledToolMeta {
@@ -59,9 +73,14 @@ pub struct InstalledToolMeta {
     pub platform: String,
     /// Binary names installed into `$PREFIX/bin`.
     pub installed_bins: Vec<String>,
+    /// Names exposed on `$PIXI_HOME/bin` (global only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposed_bins: Vec<String>,
 }
 
 /// Resolve the environment prefix path for an install target.
+///
+/// Local prefixes must already exist (`pixi install`). Global prefixes are created.
 pub fn resolve_prefix(target: &InstallTarget) -> Result<PathBuf, PixiError> {
     match target {
         InstallTarget::Local {
@@ -75,8 +94,22 @@ pub fn resolve_prefix(target: &InstallTarget) -> Result<PathBuf, PixiError> {
                 Err(PixiError::MissingPrefix(prefix))
             }
         }
-        InstallTarget::Global { .. } => Err(PixiError::NotImplemented("global install (Phase 2)")),
+        InstallTarget::Global { env } => {
+            let prefix = pixi_home().join("envs").join(env);
+            fs::create_dir_all(bin_dir(&prefix)).map_err(|e| PixiError::Io(e.to_string()))?;
+            Ok(prefix)
+        }
     }
+}
+
+/// Sanitize a tool id into a global env directory name.
+pub fn global_env_name(tool_id: &str) -> String {
+    let safe = tool_id
+        .strip_prefix("github:")
+        .unwrap_or(tool_id)
+        .replace(['/', ':'], "-")
+        .to_ascii_lowercase();
+    format!("pixi-mise-{safe}")
 }
 
 /// Return `$PREFIX/bin` for a resolved prefix.
@@ -101,29 +134,34 @@ pub fn pixi_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".pixi"))
 }
 
+/// Path to the global pixi-mise config (`$PIXI_HOME/pixi-mise.toml`).
+pub fn global_config_path() -> PathBuf {
+    pixi_home().join("pixi-mise.toml")
+}
+
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Directory for pixi-mise install metadata inside a workspace.
-pub fn mise_meta_dir(workspace_root: &Path, env: &str) -> PathBuf {
-    workspace_root.join(".pixi").join("mise").join(env)
+/// Directory for pixi-mise install metadata.
+pub fn mise_meta_dir(meta_root: &Path, env: &str) -> PathBuf {
+    meta_root.join("mise").join(env)
 }
 
-fn meta_path(workspace_root: &Path, env: &str, tool_id: &str) -> PathBuf {
+fn meta_path(meta_root: &Path, env: &str, tool_id: &str) -> PathBuf {
     let safe = tool_id.replace([':', '/'], "--");
-    mise_meta_dir(workspace_root, env).join(format!("{safe}.json"))
+    mise_meta_dir(meta_root, env).join(format!("{safe}.json"))
 }
 
 /// Write install metadata for a tool.
 pub fn write_tool_meta(
-    workspace_root: &Path,
+    meta_root: &Path,
     env: &str,
     meta: &InstalledToolMeta,
 ) -> Result<PathBuf, PixiError> {
-    let dir = mise_meta_dir(workspace_root, env);
+    let dir = mise_meta_dir(meta_root, env);
     fs::create_dir_all(&dir).map_err(|e| PixiError::Io(e.to_string()))?;
-    let path = meta_path(workspace_root, env, &meta.id);
+    let path = meta_path(meta_root, env, &meta.id);
     let json = serde_json::to_string_pretty(meta).map_err(|e| PixiError::Io(e.to_string()))?;
     fs::write(&path, json).map_err(|e| PixiError::Io(e.to_string()))?;
     Ok(path)
@@ -131,11 +169,11 @@ pub fn write_tool_meta(
 
 /// Read install metadata for a tool, if present.
 pub fn read_tool_meta(
-    workspace_root: &Path,
+    meta_root: &Path,
     env: &str,
     tool_id: &str,
 ) -> Result<Option<InstalledToolMeta>, PixiError> {
-    let path = meta_path(workspace_root, env, tool_id);
+    let path = meta_path(meta_root, env, tool_id);
     if !path.is_file() {
         return Ok(None);
     }
@@ -145,11 +183,8 @@ pub fn read_tool_meta(
 }
 
 /// List all installed tool metadata for an environment.
-pub fn list_tool_meta(
-    workspace_root: &Path,
-    env: &str,
-) -> Result<Vec<InstalledToolMeta>, PixiError> {
-    let dir = mise_meta_dir(workspace_root, env);
+pub fn list_tool_meta(meta_root: &Path, env: &str) -> Result<Vec<InstalledToolMeta>, PixiError> {
+    let dir = mise_meta_dir(meta_root, env);
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
@@ -171,8 +206,8 @@ pub fn list_tool_meta(
 }
 
 /// Remove install metadata for a tool.
-pub fn remove_tool_meta(workspace_root: &Path, env: &str, tool_id: &str) -> Result<(), PixiError> {
-    let path = meta_path(workspace_root, env, tool_id);
+pub fn remove_tool_meta(meta_root: &Path, env: &str, tool_id: &str) -> Result<(), PixiError> {
+    let path = meta_path(meta_root, env, tool_id);
     if path.is_file() {
         fs::remove_file(&path).map_err(|e| PixiError::Io(e.to_string()))?;
     }
@@ -204,7 +239,39 @@ pub fn remove_binaries(prefix: &Path, bins: &[String]) -> Result<(), PixiError> 
     let dir = bin_dir(prefix);
     for bin in bins {
         let path = dir.join(bin);
-        if path.is_file() {
+        if path.is_file() || path.is_symlink() {
+            fs::remove_file(&path).map_err(|e| PixiError::Io(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Expose a binary onto `$PIXI_HOME/bin` via symlink (copy on failure / Windows).
+pub fn expose_binary(prefix_bin: &Path, expose_name: &str) -> Result<PathBuf, PixiError> {
+    let home_bin = pixi_home().join("bin");
+    fs::create_dir_all(&home_bin).map_err(|e| PixiError::Io(e.to_string()))?;
+    let target = prefix_bin;
+    let link = home_bin.join(expose_name);
+    if link.exists() || link.is_symlink() {
+        fs::remove_file(&link).map_err(|e| PixiError::Io(e.to_string()))?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, &link).map_err(|e| PixiError::Io(e.to_string()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::copy(target, &link).map_err(|e| PixiError::Io(e.to_string()))?;
+    }
+    Ok(link)
+}
+
+/// Remove exposed names from `$PIXI_HOME/bin`.
+pub fn unexpose_binaries(names: &[String]) -> Result<(), PixiError> {
+    let home_bin = pixi_home().join("bin");
+    for name in names {
+        let path = home_bin.join(name);
+        if path.exists() || path.is_symlink() {
             fs::remove_file(&path).map_err(|e| PixiError::Io(e.to_string()))?;
         }
     }
@@ -237,6 +304,7 @@ mod tests {
             url: "https://example.com".into(),
             platform: "linux-64".into(),
             installed_bins: vec!["gh".into()],
+            exposed_bins: vec!["gh".into()],
         };
         write_tool_meta(&root, "default", &meta).unwrap();
         let loaded = read_tool_meta(&root, "default", "github:cli/cli")
@@ -264,5 +332,13 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, PixiError::MissingPrefix(_)));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn global_env_name_sanitizes() {
+        assert_eq!(
+            global_env_name("github:BurntSushi/ripgrep"),
+            "pixi-mise-burntsushi-ripgrep"
+        );
     }
 }
