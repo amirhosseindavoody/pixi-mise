@@ -3,6 +3,7 @@
 #![deny(missing_docs)]
 
 use std::io::Read;
+use std::thread;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -12,7 +13,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum GithubError {
     /// HTTP / network failure.
-    #[error("GitHub HTTP error: {0}")]
+    #[error("{0}")]
     Http(String),
     /// API returned a non-success status.
     #[error("GitHub API {status}: {message}")]
@@ -108,8 +109,13 @@ impl GithubClient {
     /// Create a client with an explicit token (or none).
     pub fn with_token(token: Option<String>) -> Self {
         let http = reqwest::blocking::Client::builder()
-            .user_agent(format!("pixi-mise/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!(
+                "pixi-mise/{} (+https://github.com/amirhosseindavoody/pixi-mise)",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .connect_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(120))
+            .pool_max_idle_per_host(2)
             .build()
             .expect("failed to build HTTP client");
         Self { http, token }
@@ -181,13 +187,7 @@ impl GithubClient {
 
     /// Download `url` into `dest`, returning bytes written.
     pub fn download(&self, url: &str, dest: &mut dyn std::io::Write) -> Result<u64, GithubError> {
-        let mut request = self.http.get(url);
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        let mut response = request
-            .send()
-            .map_err(|e| GithubError::Http(e.to_string()))?;
+        let mut response = self.send_with_retry(url, true)?;
         let status = response.status();
         if status.as_u16() == 403 || status.as_u16() == 429 {
             let message = response.text().unwrap_or_default();
@@ -218,23 +218,11 @@ impl GithubClient {
 
     /// Fetch a raw text URL (e.g. aqua-registry YAML), using the GitHub token when set.
     pub fn get_text(&self, url: &str) -> Result<String, GithubError> {
-        let mut request = self.http.get(url);
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        // Prefer raw content for githubusercontent / raw.githubusercontent.com.
-        if url.contains("api.github.com") {
-            request = request
-                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28");
-        }
-        let response = request
-            .send()
-            .map_err(|e| GithubError::Http(e.to_string()))?;
+        let response = self.send_with_retry(url, url.contains("api.github.com"))?;
         let status = response.status();
         let body = response
             .text()
-            .map_err(|e| GithubError::Http(e.to_string()))?;
+            .map_err(|e| GithubError::Http(format_reqwest_error(url, &e)))?;
         if status.as_u16() == 403 || status.as_u16() == 429 {
             return Err(GithubError::RateLimited { message: body });
         }
@@ -253,6 +241,63 @@ impl GithubClient {
     fn get_json(&self, url: &str) -> Result<String, GithubError> {
         self.get_text(url)
     }
+
+    fn send_with_retry(
+        &self,
+        url: &str,
+        github_api_headers: bool,
+    ) -> Result<reqwest::blocking::Response, GithubError> {
+        const ATTEMPTS: u32 = 3;
+        let mut last_err = None;
+        for attempt in 1..=ATTEMPTS {
+            let mut request = self.http.get(url);
+            if let Some(token) = &self.token {
+                request = request.bearer_auth(token);
+            }
+            if github_api_headers {
+                request = request
+                    .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28");
+            }
+            match request.send() {
+                Ok(response) => return Ok(response),
+                Err(err) => {
+                    let retryable = err.is_connect() || err.is_timeout() || err.is_request();
+                    tracing::warn!(
+                        attempt,
+                        attempts = ATTEMPTS,
+                        url,
+                        error = %err,
+                        retryable,
+                        "GitHub HTTP request failed"
+                    );
+                    last_err = Some(err);
+                    if !retryable || attempt == ATTEMPTS {
+                        break;
+                    }
+                    let backoff = Duration::from_millis(200 * 2u64.pow(attempt - 1));
+                    thread::sleep(backoff);
+                }
+            }
+        }
+        let err = last_err.expect("send_with_retry left no error");
+        Err(GithubError::Http(format_reqwest_error(url, &err)))
+    }
+}
+
+fn format_reqwest_error(url: &str, err: &reqwest::Error) -> String {
+    let mut parts = vec![format!("error sending request for url ({url}): {err}")];
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        parts.push(format!("caused by: {cause}"));
+        source = cause.source();
+    }
+    parts.push(
+        "hint: check network connectivity to api.github.com; set HTTPS_PROXY if you use a proxy; \
+         set GITHUB_TOKEN or GH_TOKEN for authenticated requests"
+            .into(),
+    );
+    parts.join("\n")
 }
 
 /// Select a release matching `latest` / exact tag / prefix.
@@ -348,5 +393,25 @@ mod tests {
         let releases = vec![rel("140.0.0", false), rel("14.1.0", false)];
         let got = select_release(&releases, None, false, None, Some("14"), false).unwrap();
         assert_eq!(got.tag_name, "14.1.0");
+    }
+
+    #[test]
+    fn format_reqwest_error_includes_hint() {
+        // Build a reqwest error by hitting an obviously invalid scheme/host via builder is hard;
+        // instead assert the helper keeps the URL and hint when given a synthetic timeout-like msg.
+        // We only unit-test the string composition path via a live builder error if available.
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(1))
+            .build()
+            .unwrap();
+        // 192.0.2.0/24 is TEST-NET; connection should fail quickly.
+        let err = client
+            .get("https://192.0.2.1/")
+            .send()
+            .expect_err("expected network failure");
+        let msg = format_reqwest_error("https://api.github.com/repos/x/y/releases/latest", &err);
+        assert!(msg.contains("https://api.github.com/repos/x/y/releases/latest"));
+        assert!(msg.contains("GITHUB_TOKEN") || msg.contains("HTTPS_PROXY"));
+        assert!(msg.contains("caused by:") || msg.contains("error sending request"));
     }
 }

@@ -109,6 +109,15 @@ Global tools live in a sidecar `$PIXI_HOME/pixi-mise.toml` (separate from Pixi�
 
 Installs write `pixi-mise.lock` (workspace) or `$PIXI_HOME/pixi-mise.lock` (global) with asset URL + `sha256:…`. Use `pixi mise install --locked` to reuse locked assets.
 
+### Troubleshooting GitHub HTTP errors
+
+If resolve fails with `error sending request for url (https://api.github.com/…)`:
+
+1. Confirm you can reach GitHub: `curl -I https://api.github.com`
+2. Behind a proxy, set `HTTPS_PROXY` / `HTTP_PROXY` (system proxy settings are also honored)
+3. Set `GITHUB_TOKEN` or `GH_TOKEN` for authenticated API access (higher rate limits)
+4. Rebuild/reinstall a current `pixi-mise` — older builds disabled system proxy and native TLS roots
+
 ## Development
 
 ```bash
