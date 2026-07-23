@@ -34,6 +34,34 @@ jobs:
       - name: Build binary
         run: pixi run build
 
+      - name: Integration smoke (install ripgrep)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BIN="$PWD/target/debug/pixi-mise"
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+          cat > "$WORK/pixi.toml" <<'EOF'
+          [workspace]
+          name = "pixi-mise-smoke"
+          channels = ["conda-forge"]
+          platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
+          EOF
+          # Strip accidental leading indentation from the heredoc body.
+          sed -i 's/^[[:space:]]*//' "$WORK/pixi.toml"
+          # Ensure a Pixi env prefix exists for local installs.
+          (cd "$WORK" && pixi install)
+          "$BIN" --version
+          "$BIN" search github:BurntSushi/ripgrep | head -n 5
+          (cd "$WORK" && "$BIN" add github:BurntSushi/ripgrep@14)
+          (cd "$WORK" && "$BIN" which rg)
+          test -x "$WORK/.pixi/envs/default/bin/rg"
+          "$WORK/.pixi/envs/default/bin/rg" --version
+          (cd "$WORK" && "$BIN" list)
+          (cd "$WORK" && "$BIN" update github:BurntSushi/ripgrep)
+          (cd "$WORK" && "$BIN" --dry-run clean cache)
+
       - name: Build conda package
         run: pixi run package
 

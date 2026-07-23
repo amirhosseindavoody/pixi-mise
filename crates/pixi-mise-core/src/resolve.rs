@@ -4,12 +4,10 @@ use pixi_mise_assets::{AssetCandidate, HostPlatform, PickOptions, pick_asset};
 use pixi_mise_github::{GithubClient, select_release};
 
 use crate::lockfile::LockEntry;
+use crate::version::select_best_tag;
 use crate::{CoreError, ResolvedAsset, ToolRequest, ToolVersion, VersionSpec};
 
 /// Resolve a tool request to a concrete release asset for `host`.
-///
-/// When `locked` is provided for this tool+platform, that asset is used as-is
-/// (URL / name / checksum) without re-querying GitHub asset selection.
 pub fn resolve_tool(
     client: &GithubClient,
     request: &ToolRequest,
@@ -44,37 +42,44 @@ pub fn resolve_tool_with_lock(
 
     let owner = &request.id.owner;
     let repo = &request.id.repo;
+    let version_prefix = request.options.version_prefix.as_deref();
+    let allow_pre = request.options.prerelease;
 
-    let (want_latest, exact, prefix) = match &request.version {
-        VersionSpec::Latest => (true, None, None),
-        VersionSpec::Exact(v) => (false, Some(v.as_str()), None),
-        VersionSpec::Prefix(v) => (false, None, Some(v.as_str())),
-    };
-
-    let latest = if want_latest {
-        match client.latest_release(owner, repo) {
-            Ok(r) => Some(r),
-            Err(pixi_mise_github::GithubError::NotFound(_)) => None,
+    let release = match &request.version {
+        VersionSpec::Latest => match client.latest_release(owner, repo) {
+            Ok(r) if allow_pre || !r.prerelease => r,
+            Ok(_) | Err(pixi_mise_github::GithubError::NotFound(_)) => {
+                let releases = client.list_releases(owner, repo)?;
+                select_release(&releases, None, true, None, None, allow_pre)?.clone()
+            }
             Err(e) => return Err(e.into()),
+        },
+        other => {
+            let releases = client.list_releases(owner, repo)?;
+            let tags: Vec<&str> = releases
+                .iter()
+                .filter(|r| allow_pre || !r.prerelease)
+                .map(|r| r.tag_name.as_str())
+                .collect();
+            let best = select_best_tag(tags, other, version_prefix, allow_pre)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    pixi_mise_github::GithubError::NotFound(format!(
+                        "no release matching version spec `{}`",
+                        other.to_config_string()
+                    ))
+                })?;
+            releases
+                .into_iter()
+                .find(|r| r.tag_name == best)
+                .ok_or_else(|| {
+                    pixi_mise_github::GithubError::NotFound(format!(
+                        "no release matching version spec `{}`",
+                        other.to_config_string()
+                    ))
+                })?
         }
-    } else {
-        None
     };
-
-    let releases = if want_latest && latest.is_some() {
-        Vec::new()
-    } else {
-        client.list_releases(owner, repo)?
-    };
-
-    let release = select_release(
-        &releases,
-        latest.as_ref(),
-        want_latest,
-        exact,
-        prefix,
-        request.options.prerelease,
-    )?;
 
     let candidates: Vec<AssetCandidate> = release
         .assets
@@ -86,7 +91,7 @@ pub fn resolve_tool_with_lock(
         })
         .collect();
 
-    let version = display_version(&release.tag_name, request.options.version_prefix.as_deref());
+    let version = display_version(&release.tag_name, version_prefix);
 
     let picked = pick_asset(
         &candidates,

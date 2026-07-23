@@ -12,10 +12,11 @@ use pixi_mise_core::pixi::{
     remove_tool_meta, resolve_prefix, unexpose_binaries,
 };
 use pixi_mise_core::{
-    ConfigSource, Lockfile, ToolOptions, add_tool_to_global_config, add_tool_to_pixi_toml,
-    find_workspace_root, install_tool, load_global_tools, load_workspace_tools, normalize_tool_arg,
-    parse_tool_spec, remove_tool_from_global_config, remove_tool_from_pixi_toml, resolve_tool,
-    resolve_tool_with_lock, tool_request_from_spec,
+    ConfigSource, Lockfile, ToolOptions, VersionSpec, add_tool_to_global_config,
+    add_tool_to_pixi_toml, cache_root, clear_cache, find_workspace_root, import_mise_tools,
+    install_tool, invalidate_cached_asset, load_global_tools, load_workspace_tools,
+    normalize_tool_arg, parse_tool_spec, remove_tool_from_global_config,
+    remove_tool_from_pixi_toml, resolve_tool, resolve_tool_with_lock, tool_request_from_spec,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -122,6 +123,9 @@ enum Commands {
     },
     /// Rewrite lockfile from current resolution (no install).
     Lock,
+    /// Import `github:` tools from `mise.toml` into `pixi.toml`.
+    #[command(name = "import-mise")]
+    ImportMise,
     /// Show resolved assets without installing.
     Resolve {
         /// Optional tool spec to resolve.
@@ -204,14 +208,15 @@ fn run(cli: Cli) -> Result<()> {
         Commands::List => cmd_list(&env),
         Commands::Resolve { tool } => cmd_resolve(tool.as_deref(), &host, locked),
         Commands::Lock => cmd_lock(&host),
-        Commands::Reinstall { tool } => stub("reinstall", tool.as_deref()),
-        Commands::Update { tool } => stub("update", tool.as_deref()),
-        Commands::Upgrade { tool } => stub("upgrade", tool.as_deref()),
-        Commands::Search { tool } => stub("search", Some(&tool)),
-        Commands::Which { bin } => stub("which", Some(&bin)),
+        Commands::ImportMise => cmd_import_mise(dry_run),
+        Commands::Reinstall { tool } => cmd_reinstall(tool.as_deref(), &env, &host, dry_run),
+        Commands::Update { tool } => cmd_update(tool.as_deref(), &env, &host, dry_run),
+        Commands::Upgrade { tool } => cmd_upgrade(tool.as_deref(), &env, &host, dry_run),
+        Commands::Search { tool } => cmd_search(&tool),
+        Commands::Which { bin } => cmd_which(&bin, &env),
         Commands::Clean {
             command: CleanCommands::Cache,
-        } => stub("clean cache", None),
+        } => cmd_clean_cache(dry_run),
         Commands::Global { command } => {
             run_global(command, cli.environment.as_deref(), &host, dry_run, locked)
         }
@@ -232,25 +237,10 @@ fn run_global(
             cmd_global_install(tool.as_deref(), environment, host, dry_run, locked)
         }
         GlobalCommands::List => cmd_global_list(environment),
-        GlobalCommands::Update { tool } => stub("global update", tool.as_deref()),
+        GlobalCommands::Update { tool } => {
+            cmd_global_update(tool.as_deref(), environment, host, dry_run)
+        }
     }
-}
-
-fn stub(command: &str, tool: Option<&str>) -> Result<()> {
-    if let Some(spec) = tool
-        && (spec.contains(':') || spec.contains('/'))
-    {
-        let _ = parse_tool_spec(&normalize_tool_arg(spec)).into_diagnostic()?;
-    }
-    let detail = match tool {
-        Some(t) => format!(" for `{t}`"),
-        None => String::new(),
-    };
-    miette::bail!(
-        "`pixi mise {command}`{detail} is not implemented yet.\n\
-         Phase 2 covers global add/install/list/remove, lockfiles, and asset overrides.\n\
-         See docs/DESIGN.md."
-    );
 }
 
 fn workspace_root() -> Result<PathBuf> {
@@ -813,6 +803,339 @@ fn cmd_global_remove(tool: &str, environment: Option<&str>, dry_run: bool) -> Re
     Ok(())
 }
 
+fn filter_requests(
+    mut tools: Vec<pixi_mise_core::ToolRequest>,
+    tool: Option<&str>,
+    missing_msg: impl FnOnce(&str) -> String,
+) -> Result<Vec<pixi_mise_core::ToolRequest>> {
+    if let Some(spec) = tool {
+        let (id, _) = parse_tool_spec(&normalize_tool_arg(spec)).into_diagnostic()?;
+        let found = tools
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| miette!("{}", missing_msg(&id.github_spec())))?;
+        Ok(vec![found])
+    } else {
+        tools.sort_by_key(|t| t.id.as_str());
+        Ok(tools)
+    }
+}
+
+fn cmd_search(tool: &str) -> Result<()> {
+    let (id, _) = parse_tool_spec(&normalize_tool_arg(tool)).into_diagnostic()?;
+    let client = GithubClient::new();
+    let releases = client
+        .list_releases(&id.owner, &id.repo)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to list releases for {}", id.github_spec()))?;
+    if releases.is_empty() {
+        println!("no releases found for {}", id.github_spec());
+        return Ok(());
+    }
+    println!("Recent releases for {}:", id.github_spec());
+    for release in releases.into_iter().take(30) {
+        let kind = if release.prerelease {
+            "prerelease"
+        } else {
+            "stable"
+        };
+        println!("  {:24} ({kind})", release.tag_name);
+    }
+    Ok(())
+}
+
+fn cmd_update(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool) -> Result<()> {
+    let root = workspace_root()?;
+    let cfg = load_workspace_tools(&root)
+        .into_diagnostic()
+        .wrap_err("failed to load workspace tools")?;
+    let requests = filter_requests(cfg.tools, tool, |id| {
+        format!("tool `{id}` is not configured in pixi.toml")
+    })?;
+    if requests.is_empty() {
+        println!("no tools configured under [tool.pixi-mise.tools]");
+        return Ok(());
+    }
+
+    let client = GithubClient::new();
+    let meta_root = root.join(".pixi");
+    for request in &requests {
+        let previous = read_tool_meta(&meta_root, env, &request.id.github_spec())
+            .into_diagnostic()?
+            .map(|m| m.tag);
+        // Ignore lock so we re-resolve within the current version spec.
+        let resolved = resolve_tool(&client, request, host)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))?;
+        match &previous {
+            Some(old) if old == &resolved.tag => {
+                println!(
+                    "{}: already up to date at {}",
+                    request.id.github_spec(),
+                    resolved.tag
+                );
+            }
+            Some(old) => {
+                println!("{}: {} -> {}", request.id.github_spec(), old, resolved.tag);
+            }
+            None => {
+                println!("{}: installing {}", request.id.github_spec(), resolved.tag);
+            }
+        }
+        let target = InstallTarget::Local {
+            workspace_root: root.clone(),
+            env: env.to_string(),
+        };
+        let outcome = install_tool(&client, &resolved, &target, host, dry_run)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to install {}", request.id.github_spec()))?;
+        print_install_outcome(&outcome, dry_run);
+    }
+    Ok(())
+}
+
+fn cmd_upgrade(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool) -> Result<()> {
+    let root = workspace_root()?;
+    let pixi_toml = root.join("pixi.toml");
+    let cfg = load_workspace_tools(&root)
+        .into_diagnostic()
+        .wrap_err("failed to load workspace tools")?;
+    let requests = filter_requests(cfg.tools, tool, |id| {
+        format!("tool `{id}` is not configured in pixi.toml")
+    })?;
+    if requests.is_empty() {
+        println!("no tools configured under [tool.pixi-mise.tools]");
+        return Ok(());
+    }
+
+    let client = GithubClient::new();
+    for mut request in requests {
+        let previous_spec = request.version.to_config_string();
+        // Upgrade loosens the pin: resolve latest, then write Exact into config.
+        request.version = VersionSpec::Latest;
+        let resolved = resolve_tool(&client, &request, host)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))?;
+        let new_spec = VersionSpec::Exact(resolved.version.clone());
+        println!(
+            "{}: config `{}` -> `{}` (tag {})",
+            request.id.github_spec(),
+            previous_spec,
+            new_spec.to_config_string(),
+            resolved.tag
+        );
+        if !dry_run {
+            add_tool_to_pixi_toml(&pixi_toml, &request.id, &new_spec, &request.options)
+                .into_diagnostic()
+                .wrap_err("failed to update pixi.toml")?;
+        }
+        request.version = new_spec;
+        let target = InstallTarget::Local {
+            workspace_root: root.clone(),
+            env: env.to_string(),
+        };
+        let outcome = install_tool(&client, &resolved, &target, host, dry_run)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to install {}", request.id.github_spec()))?;
+        print_install_outcome(&outcome, dry_run);
+    }
+    Ok(())
+}
+
+fn cmd_reinstall(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool) -> Result<()> {
+    let root = workspace_root()?;
+    let cfg = load_workspace_tools(&root)
+        .into_diagnostic()
+        .wrap_err("failed to load workspace tools")?;
+    let requests = filter_requests(cfg.tools, tool, |id| {
+        format!("tool `{id}` is not configured in pixi.toml")
+    })?;
+    if requests.is_empty() {
+        println!("no tools configured under [tool.pixi-mise.tools]");
+        return Ok(());
+    }
+
+    let client = GithubClient::new();
+    let lock_path = Lockfile::workspace_path(&root);
+    let lock = Lockfile::load(&lock_path).into_diagnostic()?;
+    let meta_root = root.join(".pixi");
+
+    for request in &requests {
+        let tool_id = request.id.github_spec();
+        if let Some(meta) = read_tool_meta(&meta_root, env, &tool_id).into_diagnostic()? {
+            invalidate_cached_asset(&request.id.owner, &request.id.repo, &meta.tag, &meta.asset)
+                .into_diagnostic()?;
+        } else if let Some(entry) = lock.find(&tool_id, &host.pixi_platform()) {
+            invalidate_cached_asset(
+                &request.id.owner,
+                &request.id.repo,
+                &entry.tag,
+                &entry.asset,
+            )
+            .into_diagnostic()?;
+        }
+        let resolved = resolve_tool(&client, request, host)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve {tool_id}"))?;
+        println!("reinstalling {tool_id} @ {}", resolved.tag);
+        let target = InstallTarget::Local {
+            workspace_root: root.clone(),
+            env: env.to_string(),
+        };
+        let outcome = install_tool(&client, &resolved, &target, host, dry_run)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to reinstall {tool_id}"))?;
+        print_install_outcome(&outcome, dry_run);
+    }
+    Ok(())
+}
+
+fn cmd_which(bin: &str, env: &str) -> Result<()> {
+    // Prefer workspace install, then global expose.
+    if let Ok(root) = workspace_root() {
+        let local = root
+            .join(".pixi")
+            .join("envs")
+            .join(env)
+            .join("bin")
+            .join(bin);
+        if local.is_file() {
+            println!("{}", local.display());
+            return Ok(());
+        }
+        // Fall back to configured rename/expose names when `bin` is a tool id key.
+        if let Ok(cfg) = load_workspace_tools(&root) {
+            for req in &cfg.tools {
+                if req.id.github_spec() == bin
+                    || req.id.repo == bin
+                    || format!("github:{}", req.id.as_str()) == bin
+                {
+                    let name = req
+                        .options
+                        .expose_as
+                        .as_deref()
+                        .or(req.options.rename_exe.as_deref())
+                        .or(req.options.bin.as_deref())
+                        .unwrap_or(req.id.repo.as_str());
+                    let path = root
+                        .join(".pixi")
+                        .join("envs")
+                        .join(env)
+                        .join("bin")
+                        .join(name);
+                    if path.is_file() {
+                        println!("{}", path.display());
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    let global = pixi_home().join("bin").join(bin);
+    if global.is_file() {
+        println!("{}", global.display());
+        return Ok(());
+    }
+
+    Err(miette!(
+        "`{bin}` not found in workspace or global pixi-mise bins"
+    ))
+}
+
+fn cmd_clean_cache(dry_run: bool) -> Result<()> {
+    let root = cache_root();
+    if dry_run {
+        println!("would clear cache at {}", root.display());
+        return Ok(());
+    }
+    let cleared = clear_cache().into_diagnostic()?;
+    println!("cleared cache at {}", cleared.display());
+    Ok(())
+}
+
+fn cmd_import_mise(dry_run: bool) -> Result<()> {
+    let root = workspace_root()?;
+    let report = import_mise_tools(&root, dry_run)
+        .into_diagnostic()
+        .wrap_err("failed to import mise.toml tools")?;
+    if report.added.is_empty() && report.skipped.is_empty() && report.ignored.is_empty() {
+        println!("no tools found in mise.toml");
+        return Ok(());
+    }
+    for entry in &report.added {
+        if dry_run {
+            println!("would import {entry}");
+        } else {
+            println!("imported {entry}");
+        }
+    }
+    for id in &report.skipped {
+        println!("skipped {id} (already configured)");
+    }
+    for id in &report.ignored {
+        println!("ignored {id} (not a github: tool)");
+    }
+    Ok(())
+}
+
+fn cmd_global_update(
+    tool: Option<&str>,
+    environment: Option<&str>,
+    host: &HostPlatform,
+    dry_run: bool,
+) -> Result<()> {
+    let cfg = load_global_tools().into_diagnostic()?;
+    let requests = filter_requests(cfg.tools, tool, |id| {
+        format!(
+            "tool `{id}` is not configured in {}",
+            pixi_mise_core::pixi::global_config_path().display()
+        )
+    })?;
+    if requests.is_empty() {
+        println!(
+            "no tools configured under [tools] in {}",
+            pixi_mise_core::pixi::global_config_path().display()
+        );
+        return Ok(());
+    }
+
+    let client = GithubClient::new();
+    let home = pixi_home();
+    for request in &requests {
+        let env = environment
+            .map(str::to_string)
+            .unwrap_or_else(|| global_env_name(&request.id.github_spec()));
+        let previous = read_tool_meta(&home, &env, &request.id.github_spec())
+            .into_diagnostic()?
+            .map(|m| m.tag);
+        let resolved = resolve_tool(&client, request, host)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))?;
+        match &previous {
+            Some(old) if old == &resolved.tag => {
+                println!(
+                    "{}: already up to date at {}",
+                    request.id.github_spec(),
+                    resolved.tag
+                );
+            }
+            Some(old) => {
+                println!("{}: {} -> {}", request.id.github_spec(), old, resolved.tag);
+            }
+            None => {
+                println!("{}: installing {}", request.id.github_spec(), resolved.tag);
+            }
+        }
+        let target = InstallTarget::Global { env };
+        let outcome = install_tool(&client, &resolved, &target, host, dry_run)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to install {}", request.id.github_spec()))?;
+        print_install_outcome(&outcome, dry_run);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,5 +1171,38 @@ mod tests {
         let cli = Cli::try_parse_from(["pixi-mise", "--locked", "lock"]).unwrap();
         assert!(cli.locked);
         assert!(matches!(cli.command, Commands::Lock));
+    }
+
+    #[test]
+    fn parses_phase3_commands() {
+        let search = Cli::try_parse_from(["pixi-mise", "search", "github:cli/cli"]).unwrap();
+        assert!(matches!(search.command, Commands::Search { .. }));
+        let update = Cli::try_parse_from(["pixi-mise", "update"]).unwrap();
+        assert!(matches!(update.command, Commands::Update { tool: None }));
+        let upgrade = Cli::try_parse_from(["pixi-mise", "upgrade", "github:cli/cli"]).unwrap();
+        assert!(matches!(upgrade.command, Commands::Upgrade { .. }));
+        let reinstall = Cli::try_parse_from(["pixi-mise", "reinstall"]).unwrap();
+        assert!(matches!(
+            reinstall.command,
+            Commands::Reinstall { tool: None }
+        ));
+        let which = Cli::try_parse_from(["pixi-mise", "which", "rg"]).unwrap();
+        assert!(matches!(which.command, Commands::Which { .. }));
+        let clean = Cli::try_parse_from(["pixi-mise", "clean", "cache"]).unwrap();
+        assert!(matches!(
+            clean.command,
+            Commands::Clean {
+                command: CleanCommands::Cache
+            }
+        ));
+        let import = Cli::try_parse_from(["pixi-mise", "import-mise"]).unwrap();
+        assert!(matches!(import.command, Commands::ImportMise));
+        let gupdate = Cli::try_parse_from(["pixi-mise", "global", "update"]).unwrap();
+        assert!(matches!(
+            gupdate.command,
+            Commands::Global {
+                command: GlobalCommands::Update { tool: None }
+            }
+        ));
     }
 }

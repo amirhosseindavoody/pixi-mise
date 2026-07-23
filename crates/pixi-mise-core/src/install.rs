@@ -225,13 +225,45 @@ pub fn install_tool_local(
 }
 
 fn cache_dir_for(owner: &str, repo: &str, tag: &str) -> PathBuf {
-    let base = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        PathBuf::from(xdg)
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".cache")
-    } else {
-        PathBuf::from(".cache")
-    };
     let safe_tag = tag.replace('/', "_");
-    base.join("pixi-mise").join(owner).join(repo).join(safe_tag)
+    cache_root().join(owner).join(repo).join(safe_tag)
+}
+
+/// Root directory for downloaded release assets.
+pub fn cache_root() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        PathBuf::from(xdg).join("pixi-mise")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(".cache").join("pixi-mise")
+    } else {
+        PathBuf::from(".cache").join("pixi-mise")
+    }
+}
+
+/// Delete the entire pixi-mise download cache.
+pub fn clear_cache() -> Result<PathBuf, CoreError> {
+    let root = cache_root();
+    if root.is_dir() {
+        fs::remove_dir_all(&root).map_err(|e| CoreError::Install(e.to_string()))?;
+    }
+    Ok(root)
+}
+
+/// Remove a cached asset so the next install re-downloads it.
+pub fn invalidate_cached_asset(
+    owner: &str,
+    repo: &str,
+    tag: &str,
+    asset: &str,
+) -> Result<(), CoreError> {
+    let dir = cache_dir_for(owner, repo, tag);
+    let archive = dir.join(asset);
+    if archive.is_file() {
+        fs::remove_file(&archive).map_err(|e| CoreError::Install(e.to_string()))?;
+    }
+    let staging = dir.join("staging");
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    Ok(())
 }

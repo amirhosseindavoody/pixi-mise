@@ -7,6 +7,7 @@ mod extract;
 mod install;
 mod lockfile;
 mod resolve;
+mod version;
 
 use std::path::PathBuf;
 
@@ -18,12 +19,19 @@ pub use pixi_mise_pixi as pixi;
 
 pub use config::{
     GlobalConfig, WorkspaceConfig, add_tool_to_global_config, add_tool_to_pixi_toml,
-    find_workspace_root, load_global_tools, load_workspace_tools, remove_tool_from_global_config,
-    remove_tool_from_pixi_toml,
+    find_workspace_root, import_mise_tools, load_global_tools, load_workspace_tools,
+    remove_tool_from_global_config, remove_tool_from_pixi_toml,
 };
-pub use install::{InstallOutcome, install_tool, install_tool_local};
+pub use install::{
+    InstallOutcome, cache_root, clear_cache, install_tool, install_tool_local,
+    invalidate_cached_asset,
+};
 pub use lockfile::{LockEntry, Lockfile, sha256_file, verify_sha256};
 pub use resolve::{resolve_tool, resolve_tool_with_lock};
+pub use version::{
+    ParsedVersion, normalize_tag, parse_version, parse_version_spec, select_best_tag,
+    tag_matches_spec,
+};
 
 /// Errors from core orchestration.
 #[derive(Debug, Error)]
@@ -97,8 +105,12 @@ pub enum VersionSpec {
     Latest,
     /// Exact tag match (optional `v` normalization).
     Exact(String),
-    /// Highest tag matching this prefix.
+    /// Highest tag matching this prefix (`14` → `14.1.1`).
     Prefix(String),
+    /// Caret requirement (`^1.2.3` → compatible within major).
+    Caret(String),
+    /// Tilde requirement (`~1.2.3` → compatible within minor).
+    Tilde(String),
 }
 
 impl VersionSpec {
@@ -107,6 +119,8 @@ impl VersionSpec {
         match self {
             Self::Latest => "latest".into(),
             Self::Exact(v) | Self::Prefix(v) => v.clone(),
+            Self::Caret(v) => format!("^{v}"),
+            Self::Tilde(v) => format!("~{v}"),
         }
     }
 }
@@ -198,7 +212,7 @@ pub fn parse_tool_spec(spec: &str) -> Result<(ToolId, VersionSpec), CoreError> {
         })?;
 
     let (id_part, version) = match rest.rsplit_once('@') {
-        Some((id, ver)) => (id, parse_version_spec(ver)),
+        Some((id, ver)) => (id, version::parse_version_spec(ver)),
         None => (rest, VersionSpec::Latest),
     };
 
@@ -231,20 +245,6 @@ pub fn normalize_tool_arg(spec: &str) -> String {
         spec.to_string()
     } else {
         format!("github:{spec}")
-    }
-}
-
-fn parse_version_spec(raw: &str) -> VersionSpec {
-    if raw.is_empty() || raw.eq_ignore_ascii_case("latest") {
-        VersionSpec::Latest
-    } else {
-        let stripped = raw.trim_start_matches('v');
-        // Pure numeric → prefix (`14`, `2`); otherwise exact (`14.1.1`, `v2.67.0`, `apps_v1`).
-        if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit()) {
-            VersionSpec::Prefix(stripped.to_string())
-        } else {
-            VersionSpec::Exact(raw.to_string())
-        }
     }
 }
 
@@ -288,6 +288,12 @@ mod tests {
 
         let (_, ver) = parse_tool_spec("github:BurntSushi/ripgrep@14.1.1").unwrap();
         assert_eq!(ver, VersionSpec::Exact("14.1.1".into()));
+    }
+
+    #[test]
+    fn parse_caret() {
+        let (_, ver) = parse_tool_spec("github:cli/cli@^2.60").unwrap();
+        assert_eq!(ver, VersionSpec::Caret("2.60".into()));
     }
 
     #[test]
