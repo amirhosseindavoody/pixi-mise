@@ -1,0 +1,28 @@
+---
+description: Keep project docs in sync after any code or design changes
+alwaysApply: true
+---
+
+# Keep Docs Updated
+
+After any code, config, CLI, or architecture change, update the relevant docs in the same turn before considering the work done.
+
+## Doc map
+
+| Doc | Update when |
+|-----|-------------|
+| `README.md` | User-facing usage, status, CLI examples, `pixi.toml` config shape, or high-level design highlights change |
+| `docs/DESIGN.md` | Goals, pipeline, types, Pixi integration, asset matching, lockfile, CLI surface, or implementation phases change |
+
+## Checklist
+
+1. Identify what the change affects (behavior, API/CLI, config schema, architecture).
+2. Update the matching sections so docs match the code — do not leave stale examples or outdated claims.
+3. Prefer editing existing sections over appending duplicate content.
+4. If the change is docs-only, skip this rule.
+
+## Do not
+
+- Ship code changes that contradict `README.md` or `docs/DESIGN.md`
+- Add new docs files unless the existing ones cannot cover the change
+- Mention this rule in commit messages or PR descriptions
