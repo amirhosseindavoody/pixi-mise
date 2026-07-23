@@ -122,11 +122,16 @@ CLI verbs mirror Pixi itself (`add` / `remove` / `list` / `install` / `update` /
 # Declare tools (workspace) — same verb as `pixi add`
 pixi mise add github:BurntSushi/ripgrep@14
 
+# Feature-scoped tools — same flag as `pixi add --feature`
+pixi mise add --feature test github:cli/cli
+pixi mise add -f lint github:mvdan/sh@v3   # alias -f
+
 # Global tools — same shape as `pixi global add`
 pixi mise global add github:cli/cli
 
-# Install everything declared for this workspace
+# Install everything declared for this workspace / environment
 pixi mise install
+pixi mise install --environment test
 
 # Inspect
 pixi mise list
@@ -135,6 +140,7 @@ pixi mise resolve                 # dry-run asset resolution (no Pixi equivalent
 
 # Remove
 pixi mise remove github:BurntSushi/ripgrep
+pixi mise remove --feature test github:cli/cli
 ```
 
 Typical local config (proposed `pixi.toml` table):
@@ -148,6 +154,7 @@ platforms = ["linux-64", "osx-arm64", "win-64"]
 [dependencies]
 python = "3.12.*"
 
+# Default feature (implicit) — tools for the default env
 [tool.pixi-mise.tools]
 "github:BurntSushi/ripgrep" = "14.1.1"
 "github:cli/cli" = { version = "2.67.0", matching = "gh_" }
@@ -156,6 +163,20 @@ python = "3.12.*"
 version = "apps_v1.69.0"
 matching = "oxlint"
 rename_exe = "oxlint"
+
+# Named features — tools only for environments that include that feature
+[tool.pixi-mise.feature.test.tools]
+"github:cli/cli" = "latest"
+
+[tool.pixi-mise.feature.lint.tools]
+"github:mvdan/sh" = { version = "v3", rename_exe = "shfmt" }
+
+[feature.test.dependencies]
+pytest = "*"
+
+[environments]
+test = { features = ["test"] }
+lint = { features = ["lint"] }
 ```
 
 Global config lives in a **sidecar** file `$PIXI_HOME/pixi-mise.toml` (not Pixi’s `pixi-global.toml`):
@@ -182,8 +203,10 @@ Optionally read a subset of `mise.toml` `[tools]` entries that use the `github:`
 ┌─────────────────────────────────────────────────────────────┐
 │ Config discovery                                            │
 │  - walk parents for pixi.toml / pixi-mise.toml [/ mise.toml]│
+│  - load default + feature-scoped tool tables                │
 │  - merge global config                                      │
 │  - produce Vec<ToolRequest> + install target (local/global) │
+│  - for local: union tools by env’s feature set              │
 └────────────────────────────┬────────────────────────────────┘
                              │
                              ▼
@@ -252,6 +275,13 @@ pub struct ToolRequest {
     pub version: VersionSpec,          // Latest | Exact | Prefix
     pub options: ToolOptions,
     pub source: ConfigSource,          // which file/table
+    pub feature: FeatureName,          // Default | Named(String)
+}
+
+/// Pixi feature that owns a tool declaration (local workspace only).
+pub enum FeatureName {
+    Default,                           // `[tool.pixi-mise.tools]`
+    Named(String),                     // `[tool.pixi-mise.feature.<name>.tools]`
 }
 
 pub struct ToolOptions {
@@ -300,6 +330,11 @@ Inspired by mise’s hierarchical merge, but anchored on Pixi workspaces.
 3. Parent directories until filesystem root (or until a `[workspace]` / `[project]` pixi root is found — **stop at workspace root** for tool lists; do not inherit another project’s tools by default)
 4. Global: `$PIXI_HOME/pixi-mise.toml` (always merged for `pixi mise global …`; optionally merged as defaults for local if we add `inherit_global = true` later)
 
+When loading workspace tools, read:
+
+- `[tool.pixi-mise.tools]` → `FeatureName::Default`
+- each `[tool.pixi-mise.feature.<name>.tools]` → `FeatureName::Named(name)`
+
 v1 recommendation: **tools are workspace-scoped**. Walking past the Pixi workspace root is not required for the MVP and avoids surprising inheritance.
 
 ### Environment selection
@@ -307,6 +342,42 @@ v1 recommendation: **tools are workspace-scoped**. Walking past the Pixi workspa
 - Default local env: Pixi’s default environment (`default`).
 - Override: `--environment <name>` / `PIXI_MISE_ENVIRONMENT`.
 - Global: each tool gets its own isolated env under `$PIXI_HOME/envs/pixi-mise-<tool>` (mirrors `pixi global` isolation), unless `--environment` groups tools together.
+
+### Feature-scoped tools (local only)
+
+Pixi models optional dependency sets as **features**, composed into **environments**. `pixi mise` mirrors that for GitHub tools in local/workspace mode (not global).
+
+**Config tables**
+
+| Feature | TOML table |
+|---------|------------|
+| Default (unnamed) | `[tool.pixi-mise.tools]` |
+| Named `F` | `[tool.pixi-mise.feature.F.tools]` |
+
+Same tool entry shapes (string version or inline table with `matching`, `rename_exe`, …) apply in both places. `feature` is a reserved subkey under `[tool.pixi-mise]` and must not be used as a tool id.
+
+**CLI (`pixi mise add` / `remove` / `upgrade`)**
+
+| Flag | Behaviour |
+|------|-----------|
+| *(none)* / `--feature default` | Write to `[tool.pixi-mise.tools]` (Pixi-compatible default). |
+| `--feature <name>` / `-f <name>` | Write to `[tool.pixi-mise.feature.<name>.tools]`. Creates the table if missing. |
+
+`--feature` applies only to **local** workspace commands. `pixi mise global …` ignores features (global tools stay in `$PIXI_HOME/pixi-mise.toml`).
+
+**Install target resolution**
+
+On `add` / `install` / `update` / `upgrade` / `reinstall`, which tools go into which prefix:
+
+1. Parse `[environments]` (and implicit default) from `pixi.toml`.
+2. For environment `E`, collect tools from every feature included in `E`:
+   - Always include default-feature tools unless the env sets `no-default-feature = true`.
+   - Union tools from each named feature listed in `E`’s `features = […]`.
+3. Install that union into `.pixi/envs/<E>/bin/`.
+4. If `--environment E` is set, only install for `E`.
+5. If `--feature F` is set on `add` without `--environment`, install into **every** environment that includes `F` (same idea as `pixi add --feature` refreshing envs that use the feature). If no environment includes `F` yet, still write the config entry and warn that nothing was installed until an env references the feature (or the user passes `--environment`).
+
+`pixi mise list --environment E` shows the resolved union for `E`. `list` without `--environment` shows tools grouped by feature.
 
 ## 7. Resolution Pipeline
 
@@ -346,6 +417,8 @@ installed_bins = ["rg"]
 ```
 
 Install prefers lockfile URL/checksum when present and still valid; `pixi mise lock` / `install --update-lock` refreshes.
+
+Lock keys remain `(id, platform)`. If the same tool id appears in multiple features that end up in one environment with **conflicting** version/options, `install` errors and asks the user to dedupe. Identical specs across features are fine (install once).
 
 ## 8. Asset Matching Design
 
@@ -422,6 +495,8 @@ Naming follows Pixi’s built-in commands wherever the behavior matches. Aliases
 | `pixi mise lock` | `pixi lock` | Rewrite lockfile from current resolution (no install) |
 | `pixi mise clean cache` | `pixi clean cache` | Clear download cache |
 
+Local `add` / `remove` / `upgrade` accept `--feature <name>` / `-f <name>` (default: `default`), mirroring `pixi add --feature`. That selects which `[tool.pixi-mise…tools]` table is edited (§6 Feature-scoped tools).
+
 ### 10.2 Global commands
 
 Mirror `pixi global …` instead of a `--global` flag on workspace commands:
@@ -443,7 +518,7 @@ No direct Pixi equivalent; keep for GitHub-binary workflows:
 | `pixi mise resolve` | Show resolved assets without installing (dry-run) |
 | `pixi mise which <bin>` | Print installed binary path |
 
-Shared flags: `--environment`, `--platform` (cross-resolve for lock), `--dry-run` / `-n`, `--verbose`. Prefer Pixi-style update options (`--frozen`, `--locked`, `--no-install`) where they apply.
+Shared flags: `--environment`, `--feature` / `-f` (local manifest edits + install targeting, see §6), `--platform` (cross-resolve for lock), `--dry-run` / `-n`, `--verbose`. Prefer Pixi-style update options (`--frozen`, `--locked`, `--no-install`) where they apply.
 
 ## 11. Auth, Cache, Verification
 
@@ -501,16 +576,26 @@ Actionable errors, modeled on mise:
 - Platform-specific tool filters (`os = ["linux", "macos/arm64"]`) plus aqua `supported_envs`.
 - `pixi mise registry <tool> [--tag …]` to inspect resolved recipes.
 
+### Phase 5 — Feature-scoped local tools
+
+- `--feature` / `-f` on local `add` / `remove` / `upgrade`.
+- Read/write `[tool.pixi-mise.feature.<name>.tools]`; parse `[environments]` to union tools per env (respect `no-default-feature`).
+- `FeatureName` on `ToolRequest`; install targeting per §6.
+
 ## 15. Open Questions
 
 1. **Lockfile location** — Workspace: commit `pixi-mise.lock` beside `pixi.lock`. Global: `$PIXI_HOME/pixi-mise.lock`.
 2. **Upgrade policy for `latest`** — Pin on first install (lockfile); bump within constraints on `update`, loosen manifest specs on `upgrade` (Pixi semantics).
 3. **Windows shims** — Copy `.exe` vs. generate `.cmd` wrappers when exposing globally (currently copy on non-Unix).
-4. **Multi-env workspaces** — Should tools be per-feature/per-environment in `pixi.toml`, or always default env unless flagged?
+
+### Resolved
+
+- **Multi-env / features** — Tools are **per-feature** in `pixi.toml` (`[tool.pixi-mise.tools]` for default; `[tool.pixi-mise.feature.<name>.tools]` for named features). `pixi mise add --feature <name>` writes the named table. Install unions tools from the features included in the selected Pixi environment (respecting `no-default-feature`). See §6.
 
 ## 16. Success Criteria
 
 - `pixi mise add github:BurntSushi/ripgrep@14` in a Pixi workspace makes `rg` available under `pixi run rg` / `pixi shell`.
+- `pixi mise add --feature test github:cli/cli` writes to `[tool.pixi-mise.feature.test.tools]` and installs into environments that include the `test` feature.
 - `pixi mise global add github:cli/cli` makes `gh` available from `$PIXI_HOME/bin`.
 - Same config resolves correct assets on `linux-64`, `osx-arm64`, and `win-64` without per-OS `asset_pattern` for well-named releases.
 - Lockfile enables bit-for-bit reproducible CI installs when checksums are present.
