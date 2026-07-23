@@ -29,7 +29,10 @@ pub use install::{
     InstallOutcome, cache_root, clear_cache, install_tool, install_tool_local,
     invalidate_cached_asset,
 };
-pub use lockfile::{LockEntry, Lockfile, sha256_file, verify_sha256};
+pub use lockfile::{
+    EnvironmentLock, LOCKFILE_VERSION, LockEntry, Lockfile, PackageRecord, PackageRef,
+    PlatformEntry, sha256_file, verify_sha256,
+};
 pub use registry::{
     RegistryHints, RegistrySettings, constraint_matches, env_matches_host, host_matches_os_filter,
     lookup_registry_hints, merge_registry_hints,

@@ -130,7 +130,7 @@ Global tools live in a sidecar `$PIXI_HOME/pixi-mise.toml` (separate from Pixi�
 "github:cli/cli" = { version = "latest", matching = "gh_" }
 ```
 
-Installs write `pixi-mise.lock` (workspace) or `$PIXI_HOME/pixi-mise.lock` (global) with asset URL + `sha256:…`. Use `pixi mise install --locked` to reuse locked assets.
+Installs write `pixi-mise.lock` (workspace) or `$PIXI_HOME/pixi-mise.lock` (global) in a pixi.lock-like YAML schema (`version`, `environments`, deduplicated `packages` with bare `sha256`). Use `pixi mise install --locked` to reuse locked assets.
 
 ### Troubleshooting GitHub HTTP errors
 
@@ -173,7 +173,7 @@ Pixi covers Conda/PyPI well. Many CLI tools only publish GitHub release assets. 
 - **AssetPicker scoring** — OS / arch / libc / archive format / penalties (mise `asset_matcher` model)
 - **Local + global targets** — `.pixi/envs/<env>/bin` and `$PIXI_HOME` global exposure via sidecar `pixi-mise.toml` (not `pixi-global.toml`)
 - **Feature-scoped local tools** — `pixi mise add --feature <name>` → `[tool.pixi-mise.feature.<name>.tools]`; install unions by env feature set
-- **Lockfile** — `pixi-mise.lock` with sha256 for reproducible installs
+- **Lockfile** — `pixi-mise.lock` (YAML, pixi.lock-like: environments + packages + sha256) for reproducible installs
 - **Registry** — aqua-registry + local TOML recipes for awkward asset names
 - **Rust workspace** — CLI + core + GitHub + assets + Pixi adapter crates
 
