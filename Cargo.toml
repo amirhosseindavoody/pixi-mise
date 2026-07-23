@@ -22,10 +22,18 @@ pixi-mise-core = { path = "crates/pixi-mise-core" }
 pixi-mise-github = { path = "crates/pixi-mise-github" }
 pixi-mise-pixi = { path = "crates/pixi-mise-pixi" }
 
+bzip2 = "0.5"
 clap = { version = "4.5", features = ["derive", "env"] }
+flate2 = "1.1"
 miette = { version = "7.6", features = ["fancy"] }
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tar = "0.4"
 thiserror = "2.0"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+xz2 = "0.1"
+zip = { version = "2.3", default-features = false, features = ["deflate"] }

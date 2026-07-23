@@ -1,8 +1,11 @@
 //! Core types, config discovery, resolve, and install orchestration.
-//!
-//! Phase 0: type definitions and stub APIs. Parsing / resolve / install arrive in Phase 1.
 
 #![deny(missing_docs)]
+
+mod config;
+mod extract;
+mod install;
+mod resolve;
 
 use std::path::PathBuf;
 
@@ -12,12 +15,16 @@ pub use pixi_mise_assets as assets;
 pub use pixi_mise_github as github;
 pub use pixi_mise_pixi as pixi;
 
+pub use config::{
+    WorkspaceConfig, add_tool_to_pixi_toml, find_workspace_root, load_workspace_tools,
+    remove_tool_from_pixi_toml,
+};
+pub use install::{InstallOutcome, install_tool};
+pub use resolve::resolve_tool;
+
 /// Errors from core orchestration.
 #[derive(Debug, Error)]
 pub enum CoreError {
-    /// Feature not implemented yet.
-    #[error("{0} is not implemented yet (Phase 0 skeleton)")]
-    NotImplemented(&'static str),
     /// Tool spec could not be parsed.
     #[error("invalid tool spec `{spec}`: {reason}")]
     InvalidToolSpec {
@@ -26,6 +33,30 @@ pub enum CoreError {
         /// Why parsing failed.
         reason: &'static str,
     },
+    /// No Pixi workspace (`pixi.toml`) found.
+    #[error("no pixi.toml found in this directory or its parents")]
+    NoWorkspace,
+    /// Config parse / write failure.
+    #[error("config error: {0}")]
+    Config(String),
+    /// GitHub client error.
+    #[error(transparent)]
+    Github(#[from] github::GithubError),
+    /// Asset matching error.
+    #[error(transparent)]
+    Asset(#[from] assets::AssetError),
+    /// Pixi adapter error.
+    #[error(transparent)]
+    Pixi(#[from] pixi::PixiError),
+    /// Install / extract I/O.
+    #[error("install error: {0}")]
+    Install(String),
+    /// Requested tool is not in config.
+    #[error("tool `{0}` is not configured in pixi.toml")]
+    ToolNotConfigured(String),
+    /// Feature deferred to a later phase.
+    #[error("{0}")]
+    NotImplemented(&'static str),
 }
 
 /// Backend kind for a tool request.
@@ -49,6 +80,11 @@ impl ToolId {
     pub fn as_str(&self) -> String {
         format!("{}/{}", self.owner, self.repo)
     }
+
+    /// Format as `github:owner/repo`.
+    pub fn github_spec(&self) -> String {
+        format!("github:{}", self.as_str())
+    }
 }
 
 /// Version request from config / CLI.
@@ -56,10 +92,20 @@ impl ToolId {
 pub enum VersionSpec {
     /// GitHub “latest” non-prerelease (unless options say otherwise).
     Latest,
-    /// Exact tag match (optional `v` normalization later).
+    /// Exact tag match (optional `v` normalization).
     Exact(String),
     /// Highest tag matching this prefix.
     Prefix(String),
+}
+
+impl VersionSpec {
+    /// Render for `pixi.toml` storage.
+    pub fn to_config_string(&self) -> String {
+        match self {
+            Self::Latest => "latest".into(),
+            Self::Exact(v) | Self::Prefix(v) => v.clone(),
+        }
+    }
 }
 
 /// Optional install / resolve overrides (mise-compatible subset).
@@ -176,21 +222,43 @@ pub fn parse_tool_spec(spec: &str) -> Result<(ToolId, VersionSpec), CoreError> {
     ))
 }
 
+/// Normalize a CLI tool argument to `github:…` form.
+pub fn normalize_tool_arg(spec: &str) -> String {
+    if spec.starts_with("github:") {
+        spec.to_string()
+    } else {
+        format!("github:{spec}")
+    }
+}
+
 fn parse_version_spec(raw: &str) -> VersionSpec {
     if raw.is_empty() || raw.eq_ignore_ascii_case("latest") {
         VersionSpec::Latest
-    } else if raw.contains('.') || raw.chars().all(|c| c.is_ascii_digit() || c == 'v') {
-        // Heuristic: full versions / tags → Exact; short numeric prefixes → Prefix.
-        // Refined in Phase 1 against real tags.
+    } else {
         let stripped = raw.trim_start_matches('v');
-        if stripped.chars().all(|c| c.is_ascii_digit()) && !stripped.is_empty() {
+        // Pure numeric → prefix (`14`, `2`); otherwise exact (`14.1.1`, `v2.67.0`, `apps_v1`).
+        if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit()) {
             VersionSpec::Prefix(stripped.to_string())
         } else {
             VersionSpec::Exact(raw.to_string())
         }
-    } else {
-        VersionSpec::Exact(raw.to_string())
     }
+}
+
+/// Build a [`ToolRequest`] from a CLI/config spec string.
+pub fn tool_request_from_spec(
+    spec: &str,
+    source: ConfigSource,
+    options: ToolOptions,
+) -> Result<ToolRequest, CoreError> {
+    let (id, version) = parse_tool_spec(&normalize_tool_arg(spec))?;
+    Ok(ToolRequest {
+        backend: BackendKind::Github,
+        id,
+        version,
+        options,
+        source,
+    })
 }
 
 /// Crate version from Cargo.
