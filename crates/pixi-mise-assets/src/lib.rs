@@ -100,12 +100,20 @@ pub struct PickOptions {
     /// Explicit asset pattern (glob); when set, skips OS/arch scoring.
     ///
     /// Supports `*`, `?`, and placeholders: `{{version}}` / `{{.Version}}`,
-    /// `{{os}}` / `{{.OS}}`, `{{arch}}` / `{{.Arch}}`.
+    /// `{{os}}` / `{{.OS}}`, `{{arch}}` / `{{.Arch}}`, `{{.Format}}`,
+    /// `{{trimV .Version}}`.
     pub asset_pattern: Option<String>,
     /// Prefer assets whose name starts with this tool / repo name.
     pub preferred_name: Option<String>,
     /// Concrete version string used to expand `asset_pattern` placeholders.
+    ///
+    /// Prefer the raw GitHub tag (may include a leading `v`) when expanding
+    /// aqua-style `{{.Version}}` templates.
     pub version: Option<String>,
+    /// Archive format for `{{.Format}}` (e.g. `tar.gz`, `zip`).
+    pub format: Option<String>,
+    /// Aqua-style replacements applied to OS/Arch template values.
+    pub replacements: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,7 +254,7 @@ pub fn pick_asset(
 ) -> Result<PickedAsset, AssetError> {
     // `asset_pattern` replaces autodetection entirely.
     if let Some(pattern) = options.asset_pattern.as_deref() {
-        return pick_by_asset_pattern(candidates, host, pattern, options.version.as_deref());
+        return pick_by_asset_pattern(candidates, host, pattern, options);
     }
 
     let names: Vec<&AssetCandidate> =
@@ -293,14 +301,23 @@ fn pick_by_asset_pattern(
     candidates: &[AssetCandidate],
     host: &HostPlatform,
     pattern: &str,
-    version: Option<&str>,
+    options: &PickOptions,
 ) -> Result<PickedAsset, AssetError> {
-    let expanded = expand_asset_pattern(pattern, host, version);
+    let expanded = expand_asset_template(
+        pattern,
+        &TemplateContext {
+            host,
+            version: options.version.as_deref(),
+            format: options.format.as_deref(),
+            replacements: options.replacements.as_ref(),
+        },
+    );
     let mut matches: Vec<&AssetCandidate> = candidates
         .iter()
         .filter(|c| glob_match(&expanded, &c.name))
         .collect();
     if matches.is_empty() {
+        tracing::debug!(pattern = %expanded, "asset_pattern matched no assets");
         return Err(AssetError::NoMatch);
     }
     matches.sort_by(|a, b| {
@@ -318,32 +335,65 @@ fn pick_by_asset_pattern(
     })
 }
 
-/// Expand mise/aqua-style placeholders in an asset pattern.
+/// Inputs for expanding aqua/mise asset templates.
+#[derive(Debug, Clone, Copy)]
+pub struct TemplateContext<'a> {
+    /// Host platform (OS/arch mapped to aqua GOOS/GOARCH before replacements).
+    pub host: &'a HostPlatform,
+    /// Version / tag string for `{{.Version}}`.
+    pub version: Option<&'a str>,
+    /// Archive format for `{{.Format}}`.
+    pub format: Option<&'a str>,
+    /// Optional aqua `replacements` map.
+    pub replacements: Option<&'a std::collections::HashMap<String, String>>,
+}
+
+/// Expand mise/aqua-style placeholders in an asset pattern (no replacements).
 pub fn expand_asset_pattern(pattern: &str, host: &HostPlatform, version: Option<&str>) -> String {
-    let os = match host.os.as_str() {
-        "macos" => "darwin",
-        other => other,
+    expand_asset_template(
+        pattern,
+        &TemplateContext {
+            host,
+            version,
+            format: None,
+            replacements: None,
+        },
+    )
+}
+
+/// Expand aqua-style asset templates including replacements and `{{.Format}}`.
+pub fn expand_asset_template(pattern: &str, ctx: &TemplateContext<'_>) -> String {
+    let mut os = match ctx.host.os.as_str() {
+        "macos" => "darwin".to_string(),
+        other => other.to_string(),
     };
-    let arch = match host.arch.as_str() {
-        "x64" => "amd64",
-        "arm64" => "arm64",
-        "x86" => "386",
-        other => other,
+    let mut arch = match ctx.host.arch.as_str() {
+        "x64" => "amd64".to_string(),
+        "arm64" => "arm64".to_string(),
+        "x86" => "386".to_string(),
+        other => other.to_string(),
     };
-    let arch_alt = match host.arch.as_str() {
-        "x64" => "x86_64",
-        "arm64" => "aarch64",
-        other => other,
-    };
-    let ver = version.unwrap_or("*");
+    if let Some(reps) = ctx.replacements {
+        if let Some(v) = reps.get(&os) {
+            os = v.clone();
+        }
+        if let Some(v) = reps.get(&arch) {
+            arch = v.clone();
+        }
+    }
+    let ver = ctx.version.unwrap_or("*");
+    let ver_trim = ver.trim_start_matches('v');
+    let format = ctx.format.unwrap_or("*");
     pattern
+        .replace("{{trimV .Version}}", ver_trim)
         .replace("{{.Version}}", ver)
-        .replace("{{version}}", ver)
-        .replace("{{.OS}}", os)
-        .replace("{{os}}", os)
-        .replace("{{.Arch}}", arch)
-        .replace("{{arch}}", arch)
-        .replace("{{arch_alt}}", arch_alt)
+        .replace("{{version}}", ver_trim)
+        .replace("{{.OS}}", &os)
+        .replace("{{os}}", &os)
+        .replace("{{.Arch}}", &arch)
+        .replace("{{arch}}", &arch)
+        .replace("{{.Format}}", format)
+        .replace("{{format}}", format)
 }
 
 fn glob_match(pattern: &str, text: &str) -> bool {
@@ -769,6 +819,24 @@ mod tests {
             Some("2.67.0"),
         );
         assert_eq!(expanded, "gh_2.67.0_linux_amd64.tar.gz");
+    }
+
+    #[test]
+    fn aqua_template_applies_replacements_and_trimv() {
+        let mut reps = std::collections::HashMap::new();
+        reps.insert("darwin".into(), "macOS".into());
+        reps.insert("amd64".into(), "x86_64".into());
+        reps.insert("linux".into(), "unknown-linux-musl".into());
+        let expanded = expand_asset_template(
+            "gh_{{trimV .Version}}_{{.OS}}_{{.Arch}}.{{.Format}}",
+            &TemplateContext {
+                host: &linux_x64(),
+                version: Some("v2.67.0"),
+                format: Some("tar.gz"),
+                replacements: Some(&reps),
+            },
+        );
+        assert_eq!(expanded, "gh_2.67.0_unknown-linux-musl_x86_64.tar.gz");
     }
 
     #[test]

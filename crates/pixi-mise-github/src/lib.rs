@@ -82,11 +82,6 @@ struct ApiAsset {
     size: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiErrorBody {
-    message: Option<String>,
-}
-
 /// Client for listing GitHub releases and downloading assets.
 #[derive(Debug, Clone)]
 pub struct GithubClient {
@@ -221,14 +216,17 @@ impl GithubClient {
         Ok(written)
     }
 
-    fn get_json(&self, url: &str) -> Result<String, GithubError> {
-        let mut request = self
-            .http
-            .get(url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28");
+    /// Fetch a raw text URL (e.g. aqua-registry YAML), using the GitHub token when set.
+    pub fn get_text(&self, url: &str) -> Result<String, GithubError> {
+        let mut request = self.http.get(url);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
+        }
+        // Prefer raw content for githubusercontent / raw.githubusercontent.com.
+        if url.contains("api.github.com") {
+            request = request
+                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28");
         }
         let response = request
             .send()
@@ -241,11 +239,7 @@ impl GithubClient {
             return Err(GithubError::RateLimited { message: body });
         }
         if status.as_u16() == 404 {
-            let msg = serde_json::from_str::<ApiErrorBody>(&body)
-                .ok()
-                .and_then(|b| b.message)
-                .unwrap_or(body);
-            return Err(GithubError::NotFound(msg));
+            return Err(GithubError::NotFound(body));
         }
         if !status.is_success() {
             return Err(GithubError::Api {
@@ -254,6 +248,10 @@ impl GithubClient {
             });
         }
         Ok(body)
+    }
+
+    fn get_json(&self, url: &str) -> Result<String, GithubError> {
+        self.get_text(url)
     }
 }
 

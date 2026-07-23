@@ -4,7 +4,7 @@ Install GitHub release binaries into Pixi-managed global or local environments �
 
 ## Status
 
-**Phase 3 (polish)** — `search`, `update` / `upgrade`, `reinstall`, `which`, `clean cache`, caret/tilde semver, `import-mise`, and CI install smoke.
+**Phase 4 (registry)** — Aqua-registry recipes (asset templates, replacements, `supported_envs`), optional local `pixi-mise-registry.toml`, platform `os` filters, and `pixi mise registry`.
 
 See **[DESIGN.md](./docs/DESIGN.md)** for architecture, resolution pipeline, asset matching, Pixi integration, and implementation phases.
 
@@ -57,6 +57,7 @@ pixi mise which rg
 pixi mise lock
 pixi mise import-mise
 pixi mise clean cache
+pixi mise registry github:cli/cli --tag v2.67.0
 pixi mise remove github:BurntSushi/ripgrep
 
 # Global ($PIXI_HOME/envs/… + expose on $PIXI_HOME/bin)
@@ -68,6 +69,8 @@ pixi mise global remove github:cli/cli
 
 Version specs accept `latest`, exact tags (`14.1.1`), prefixes (`14`), caret (`^1.2.3`), and tilde (`~1.2.3`). `update` re-resolves within the current spec; `upgrade` bumps the config pin to the newest Exact release.
 
+When no explicit `asset_pattern` is set, resolve consults the [aqua-registry](https://github.com/aquaproj/aqua-registry) (cached under `~/.cache/pixi-mise/registry/`) and optional workspace `pixi-mise-registry.toml`. Disable with `[tool.pixi-mise] registry = false` or per-tool `registry = false`.
+
 Tools are declared in `pixi.toml`:
 
 ```toml
@@ -75,6 +78,26 @@ Tools are declared in `pixi.toml`:
 "github:BurntSushi/ripgrep" = "14.1.1"
 "github:cli/cli" = { version = "latest", matching = "gh_" }
 "github:example/tool" = { version = "1.2.3", asset_pattern = "tool-{{os}}-{{arch}}.tar.gz", rename_exe = "tool" }
+"github:example/mac-only" = { version = "latest", os = ["macos", "macos/arm64"] }
+```
+
+Optional workspace controls:
+
+```toml
+[tool.pixi-mise]
+registry = true                    # or false / "aqua" / custom base URL
+# registry_path = "pixi-mise-registry.toml"
+```
+
+Local slim registry (`pixi-mise-registry.toml`):
+
+```toml
+[[packages]]
+id = "github:cli/cli"
+asset = "gh_{{trimV .Version}}_{{.OS}}_{{.Arch}}.{{.Format}}"
+bin = "gh"
+format = "tar.gz"
+supported_envs = ["linux", "darwin", "windows"]
 ```
 
 Global tools live in `$PIXI_HOME/pixi-mise.toml`:
@@ -118,6 +141,7 @@ Pixi covers Conda/PyPI well. Many CLI tools only publish GitHub release assets. 
 - **AssetPicker scoring** — OS / arch / libc / archive format / penalties (mise `asset_matcher` model)
 - **Local + global targets** — `.pixi/envs/<env>/bin` and `$PIXI_HOME` global exposure
 - **Lockfile** — `pixi-mise.lock` with sha256 for reproducible installs
+- **Registry** — aqua-registry + local TOML recipes for awkward asset names
 - **Rust workspace** — CLI + core + GitHub + assets + Pixi adapter crates
 
 ## License

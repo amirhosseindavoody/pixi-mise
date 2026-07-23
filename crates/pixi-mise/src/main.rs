@@ -12,11 +12,12 @@ use pixi_mise_core::pixi::{
     remove_tool_meta, resolve_prefix, unexpose_binaries,
 };
 use pixi_mise_core::{
-    ConfigSource, Lockfile, ToolOptions, VersionSpec, add_tool_to_global_config,
+    ConfigSource, Lockfile, RegistrySettings, ToolOptions, VersionSpec, add_tool_to_global_config,
     add_tool_to_pixi_toml, cache_root, clear_cache, find_workspace_root, import_mise_tools,
     install_tool, invalidate_cached_asset, load_global_tools, load_workspace_tools,
-    normalize_tool_arg, parse_tool_spec, remove_tool_from_global_config,
-    remove_tool_from_pixi_toml, resolve_tool, resolve_tool_with_lock, tool_request_from_spec,
+    lookup_registry_hints, normalize_tool_arg, parse_tool_spec, remove_tool_from_global_config,
+    remove_tool_from_pixi_toml, resolve_tool_with_settings, tool_request_from_spec,
+    workspace_registry_settings,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -151,6 +152,14 @@ enum Commands {
         /// Optional tool spec to resolve.
         tool: Option<String>,
     },
+    /// Show aqua / local registry recipe for a tool.
+    Registry {
+        /// Tool id, e.g. `github:cli/cli`.
+        tool: String,
+        /// Optional version/tag to evaluate version_overrides (default: latest tag).
+        #[arg(long = "tag", value_name = "TAG")]
+        tag: Option<String>,
+    },
     /// Print path to an installed binary.
     Which {
         /// Binary name.
@@ -227,6 +236,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Install { tool } => cmd_install(tool.as_deref(), &env, &host, dry_run, locked),
         Commands::List => cmd_list(&env),
         Commands::Resolve { tool } => cmd_resolve(tool.as_deref(), &host, locked),
+        Commands::Registry { tool, tag } => cmd_registry(&tool, tag.as_deref(), &host),
         Commands::Lock => cmd_lock(&host),
         Commands::ImportMise => cmd_import_mise(dry_run),
         Commands::Reinstall { tool } => cmd_reinstall(tool.as_deref(), &env, &host, dry_run),
@@ -274,6 +284,7 @@ fn resolve_request(
     host: &HostPlatform,
     lock_path: &std::path::Path,
     use_lock: bool,
+    registry: &RegistrySettings,
 ) -> Result<pixi_mise_core::ToolVersion> {
     let lock = Lockfile::load(lock_path).into_diagnostic()?;
     let entry = if use_lock {
@@ -281,9 +292,23 @@ fn resolve_request(
     } else {
         None
     };
-    resolve_tool_with_lock(client, request, host, entry)
+    resolve_tool_with_settings(client, request, host, entry, registry)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))
+}
+
+fn registry_for_workspace(root: &std::path::Path) -> RegistrySettings {
+    workspace_registry_settings(root)
+}
+
+fn skip_unsupported(err: &miette::Report, tool: &str) -> bool {
+    let msg = format!("{err:#}");
+    if msg.contains("is not supported on this platform") {
+        println!("skipping {tool}: {msg}");
+        true
+    } else {
+        false
+    }
 }
 
 fn cmd_add(tool: &str, env: &str, host: &HostPlatform, dry_run: bool, locked: bool) -> Result<()> {
@@ -323,7 +348,8 @@ fn cmd_add(tool: &str, env: &str, host: &HostPlatform, dry_run: bool, locked: bo
 
     let client = GithubClient::new();
     let lock_path = Lockfile::workspace_path(&root);
-    let resolved = resolve_request(&client, &request, host, &lock_path, locked)?;
+    let registry = registry_for_workspace(&root);
+    let resolved = resolve_request(&client, &request, host, &lock_path, locked, &registry)?;
     println!(
         "resolved {} @ {} → {}",
         request.id.github_spec(),
@@ -353,6 +379,7 @@ fn cmd_install(
     let cfg = load_workspace_tools(&root)
         .into_diagnostic()
         .wrap_err("failed to load workspace tools")?;
+    let registry = cfg.registry.clone();
 
     let requests = if let Some(spec) = tool {
         let (id, _) = parse_tool_spec(&normalize_tool_arg(spec)).into_diagnostic()?;
@@ -373,7 +400,12 @@ fn cmd_install(
     let client = GithubClient::new();
     let lock_path = Lockfile::workspace_path(&root);
     for request in &requests {
-        let resolved = resolve_request(&client, request, host, &lock_path, locked)?;
+        let resolved = match resolve_request(&client, request, host, &lock_path, locked, &registry)
+        {
+            Ok(r) => r,
+            Err(err) if skip_unsupported(&err, &request.id.github_spec()) => continue,
+            Err(err) => return Err(err),
+        };
         println!(
             "resolved {} @ {} → {}",
             request.id.github_spec(),
@@ -504,6 +536,7 @@ fn cmd_remove(tool: &str, env: &str, dry_run: bool) -> Result<()> {
 fn cmd_resolve(tool: Option<&str>, host: &HostPlatform, locked: bool) -> Result<()> {
     let root = workspace_root()?;
     let cfg = load_workspace_tools(&root).into_diagnostic()?;
+    let registry = cfg.registry.clone();
     let client = GithubClient::new();
     let lock_path = Lockfile::workspace_path(&root);
 
@@ -535,7 +568,12 @@ fn cmd_resolve(tool: Option<&str>, host: &HostPlatform, locked: bool) -> Result<
     }
 
     for request in &requests {
-        let resolved = resolve_request(&client, request, host, &lock_path, locked)?;
+        let resolved = match resolve_request(&client, request, host, &lock_path, locked, &registry)
+        {
+            Ok(r) => r,
+            Err(err) if skip_unsupported(&err, &request.id.github_spec()) => continue,
+            Err(err) => return Err(err),
+        };
         println!(
             "{} @ {} ({})\n  asset: {}\n  url:   {}\n  host:  {}/{} ({})",
             request.id.github_spec(),
@@ -563,12 +601,26 @@ fn cmd_lock(host: &HostPlatform) -> Result<()> {
     }
     let client = GithubClient::new();
     let lock_path = Lockfile::workspace_path(&root);
+    let registry = cfg.registry.clone();
     let mut lock = Lockfile::default();
     for request in &cfg.tools {
         // Fresh resolve (ignore existing lock) so `lock` refreshes pins.
-        let resolved = resolve_tool(&client, request, host)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))?;
+        let resolved = match resolve_tool_with_settings(&client, request, host, None, &registry) {
+            Ok(r) => r,
+            Err(pixi_mise_core::CoreError::UnsupportedPlatform {
+                tool,
+                platform,
+                reason,
+            }) => {
+                println!("skipping {tool}: not supported on {platform} ({reason})");
+                continue;
+            }
+            Err(err) => {
+                return Err(err)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()));
+            }
+        };
         println!(
             "locked {} @ {} → {}",
             request.id.github_spec(),
@@ -634,7 +686,8 @@ fn cmd_global_add(
 
     let client = GithubClient::new();
     let lock_path = Lockfile::global_path(&pixi_home());
-    let resolved = resolve_request(&client, &request, host, &lock_path, locked)?;
+    let registry = RegistrySettings::default();
+    let resolved = resolve_request(&client, &request, host, &lock_path, locked, &registry)?;
     println!(
         "resolved {} @ {} → {}",
         request.id.github_spec(),
@@ -682,11 +735,17 @@ fn cmd_global_install(
 
     let client = GithubClient::new();
     let lock_path = Lockfile::global_path(&pixi_home());
+    let registry = RegistrySettings::default();
     for request in &requests {
         let env = environment
             .map(str::to_string)
             .unwrap_or_else(|| global_env_name(&request.id.github_spec()));
-        let resolved = resolve_request(&client, request, host, &lock_path, locked)?;
+        let resolved = match resolve_request(&client, request, host, &lock_path, locked, &registry)
+        {
+            Ok(r) => r,
+            Err(err) if skip_unsupported(&err, &request.id.github_spec()) => continue,
+            Err(err) => return Err(err),
+        };
         println!(
             "resolved {} @ {} → {}",
             request.id.github_spec(),
@@ -869,6 +928,7 @@ fn cmd_update(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool)
     let cfg = load_workspace_tools(&root)
         .into_diagnostic()
         .wrap_err("failed to load workspace tools")?;
+    let registry = cfg.registry.clone();
     let requests = filter_requests(cfg.tools, tool, |id| {
         format!("tool `{id}` is not configured in pixi.toml")
     })?;
@@ -884,9 +944,22 @@ fn cmd_update(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool)
             .into_diagnostic()?
             .map(|m| m.tag);
         // Ignore lock so we re-resolve within the current version spec.
-        let resolved = resolve_tool(&client, request, host)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))?;
+        let resolved = match resolve_tool_with_settings(&client, request, host, None, &registry) {
+            Ok(r) => r,
+            Err(pixi_mise_core::CoreError::UnsupportedPlatform {
+                tool,
+                platform,
+                reason,
+            }) => {
+                println!("skipping {tool}: not supported on {platform} ({reason})");
+                continue;
+            }
+            Err(err) => {
+                return Err(err)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()));
+            }
+        };
         match &previous {
             Some(old) if old == &resolved.tag => {
                 println!(
@@ -920,6 +993,7 @@ fn cmd_upgrade(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool
     let cfg = load_workspace_tools(&root)
         .into_diagnostic()
         .wrap_err("failed to load workspace tools")?;
+    let registry = cfg.registry.clone();
     let requests = filter_requests(cfg.tools, tool, |id| {
         format!("tool `{id}` is not configured in pixi.toml")
     })?;
@@ -933,9 +1007,22 @@ fn cmd_upgrade(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bool
         let previous_spec = request.version.to_config_string();
         // Upgrade loosens the pin: resolve latest, then write Exact into config.
         request.version = VersionSpec::Latest;
-        let resolved = resolve_tool(&client, &request, host)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))?;
+        let resolved = match resolve_tool_with_settings(&client, &request, host, None, &registry) {
+            Ok(r) => r,
+            Err(pixi_mise_core::CoreError::UnsupportedPlatform {
+                tool,
+                platform,
+                reason,
+            }) => {
+                println!("skipping {tool}: not supported on {platform} ({reason})");
+                continue;
+            }
+            Err(err) => {
+                return Err(err)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()));
+            }
+        };
         let new_spec = VersionSpec::Exact(resolved.version.clone());
         println!(
             "{}: config `{}` -> `{}` (tag {})",
@@ -967,6 +1054,7 @@ fn cmd_reinstall(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bo
     let cfg = load_workspace_tools(&root)
         .into_diagnostic()
         .wrap_err("failed to load workspace tools")?;
+    let registry = cfg.registry.clone();
     let requests = filter_requests(cfg.tools, tool, |id| {
         format!("tool `{id}` is not configured in pixi.toml")
     })?;
@@ -994,9 +1082,22 @@ fn cmd_reinstall(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bo
             )
             .into_diagnostic()?;
         }
-        let resolved = resolve_tool(&client, request, host)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to resolve {tool_id}"))?;
+        let resolved = match resolve_tool_with_settings(&client, request, host, None, &registry) {
+            Ok(r) => r,
+            Err(pixi_mise_core::CoreError::UnsupportedPlatform {
+                tool,
+                platform,
+                reason,
+            }) => {
+                println!("skipping {tool}: not supported on {platform} ({reason})");
+                continue;
+            }
+            Err(err) => {
+                return Err(err)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to resolve {tool_id}"));
+            }
+        };
         println!("reinstalling {tool_id} @ {}", resolved.tag);
         let target = InstallTarget::Local {
             workspace_root: root.clone(),
@@ -1007,6 +1108,69 @@ fn cmd_reinstall(tool: Option<&str>, env: &str, host: &HostPlatform, dry_run: bo
             .wrap_err_with(|| format!("failed to reinstall {tool_id}"))?;
         print_install_outcome(&outcome, dry_run);
     }
+    Ok(())
+}
+
+fn cmd_registry(tool: &str, version: Option<&str>, host: &HostPlatform) -> Result<()> {
+    let (id, parsed_version) = parse_tool_spec(&normalize_tool_arg(tool)).into_diagnostic()?;
+    let client = GithubClient::new();
+    let root = workspace_root().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+    let mut registry = registry_for_workspace(&root);
+
+    let tag = if let Some(v) = version {
+        v.to_string()
+    } else {
+        match parsed_version {
+            VersionSpec::Latest => client
+                .latest_release(&id.owner, &id.repo)
+                .into_diagnostic()
+                .map(|r| r.tag_name)
+                .unwrap_or_else(|_| "latest".into()),
+            VersionSpec::Exact(v)
+            | VersionSpec::Prefix(v)
+            | VersionSpec::Caret(v)
+            | VersionSpec::Tilde(v) => v,
+        }
+    };
+
+    let hints = lookup_registry_hints(&client, &registry, &id, &tag, host)
+        .into_diagnostic()
+        .wrap_err("registry lookup failed")?;
+    match hints {
+        None => {
+            println!(
+                "no registry recipe for {} (registry enabled={})",
+                id.github_spec(),
+                registry.enabled
+            );
+        }
+        Some(hints) => {
+            println!("tool:    {}", id.github_spec());
+            println!("source:  {}", hints.source);
+            println!("tag:     {tag}");
+            println!("supported on {}: {}", host.pixi_platform(), hints.supported);
+            if let Some(asset) = &hints.asset_pattern {
+                println!("asset:   {asset}");
+            }
+            if let Some(fmt) = &hints.format {
+                println!("format:  {fmt}");
+            }
+            if let Some(bin) = &hints.bin {
+                println!("bin:     {bin}");
+            }
+            if !hints.replacements.is_empty() {
+                let mut pairs: Vec<_> = hints.replacements.iter().collect();
+                pairs.sort_by(|a, b| a.0.cmp(b.0));
+                let rendered = pairs
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("replace: {rendered}");
+            }
+        }
+    }
+    let _ = &mut registry;
     Ok(())
 }
 
@@ -1122,6 +1286,7 @@ fn cmd_global_update(
 
     let client = GithubClient::new();
     let home = pixi_home();
+    let registry = RegistrySettings::default();
     for request in &requests {
         let env = environment
             .map(str::to_string)
@@ -1129,9 +1294,22 @@ fn cmd_global_update(
         let previous = read_tool_meta(&home, &env, &request.id.github_spec())
             .into_diagnostic()?
             .map(|m| m.tag);
-        let resolved = resolve_tool(&client, request, host)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()))?;
+        let resolved = match resolve_tool_with_settings(&client, request, host, None, &registry) {
+            Ok(r) => r,
+            Err(pixi_mise_core::CoreError::UnsupportedPlatform {
+                tool,
+                platform,
+                reason,
+            }) => {
+                println!("skipping {tool}: not supported on {platform} ({reason})");
+                continue;
+            }
+            Err(err) => {
+                return Err(err)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to resolve {}", request.id.github_spec()));
+            }
+        };
         match &previous {
             Some(old) if old == &resolved.tag => {
                 println!(
@@ -1224,5 +1402,24 @@ mod tests {
                 command: GlobalCommands::Update { tool: None }
             }
         ));
+    }
+
+    #[test]
+    fn parses_registry_command() {
+        let cli = Cli::try_parse_from([
+            "pixi-mise",
+            "registry",
+            "github:cli/cli",
+            "--tag",
+            "v2.67.0",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Registry { tool, tag } => {
+                assert_eq!(tool, "github:cli/cli");
+                assert_eq!(tag.as_deref(), Some("v2.67.0"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
