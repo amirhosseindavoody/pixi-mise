@@ -108,7 +108,7 @@ pixi mise <subcommand> …
 | Scope | Prefix | How binaries become usable |
 |-------|--------|----------------------------|
 | Local workspace | `.pixi/envs/<env>/` | Present under `$PREFIX/bin` → available in `pixi shell` / `pixi run` |
-| Global | `$PIXI_HOME/envs/<env>/` | Binary in env `bin/` **and** exposed into `$PIXI_HOME/bin` via global manifest |
+| Global | `$PIXI_HOME/envs/<env>/` | Binary in env `bin/` **and** exposed into `$PIXI_HOME/bin` via sidecar (see §9.2) |
 
 v1 installs by placing (or symlinking) binaries into the target prefix’s `bin/` (and updating global exposures via `pixi mise global …`).
 
@@ -158,7 +158,7 @@ matching = "oxlint"
 rename_exe = "oxlint"
 ```
 
-Global config (proposed `$PIXI_HOME/pixi-mise.toml` or section in pixi global manifests):
+Global config lives in a **sidecar** file `$PIXI_HOME/pixi-mise.toml` (not Pixi’s `pixi-global.toml`):
 
 ```toml
 [tools]
@@ -166,6 +166,7 @@ Global config (proposed `$PIXI_HOME/pixi-mise.toml` or section in pixi global ma
 "github:cli/cli" = { version = "latest", expose_as = "gh" }
 ```
 
+`pixi global list` will not show these tools — use `pixi mise global list`. Both systems share `$PIXI_HOME/bin` on `PATH`.
 ### 4.2 Compatibility with `mise.toml`
 
 Optionally read a subset of `mise.toml` `[tools]` entries that use the `github:` backend. Write path for v1 remains `[tool.pixi-mise]` in `pixi.toml` / `pixi-mise.toml` so Pixi-native projects have a clear home. Full bidirectional sync with mise is out of scope for v1.
@@ -383,14 +384,21 @@ Map host → Pixi platform string for lockfile keys: `linux-64`, `linux-aarch64`
 5. Install into `.pixi/envs/<env>/bin/<name>` (copy or hardlink).
 6. Persist metadata under `.pixi/envs/<env>/conda-meta/pixi-mise-<tool>.json` (or `.pixi/mise/`) so `list` / `remove` work without scanning heuristics.
 
-### 9.2 Global
+### 9.2 Global (sidecar design)
 
-1. Create/reuse `$PIXI_HOME/envs/<env>/`.
-2. Install binary into that env’s `bin/`.
-3. Expose onto `$PIXI_HOME/bin`:
-   - Prefer writing/updating a small sidecar manifest Pixi understands if stable APIs exist; otherwise create a shim/symlink in `$PIXI_HOME/bin` and record state in `$PIXI_HOME/pixi-mise.toml`.
-4. Document that `$PIXI_HOME/bin` must be on `PATH` (same requirement as `pixi global`).
+Global GitHub tools are owned by pixi-mise, not by Pixi’s conda global manifest.
 
+1. Create/reuse `$PIXI_HOME/envs/pixi-mise-<tool>/` (or a shared env via `--environment`).
+2. Install the binary into that env’s `bin/`.
+3. Expose onto `$PIXI_HOME/bin` with a symlink (copy on Windows / when linking fails).
+4. Record the declared tool in the sidecar `$PIXI_HOME/pixi-mise.toml`; record install metadata under `$PIXI_HOME/mise/…` and the global lock at `$PIXI_HOME/pixi-mise.lock`.
+5. Document that `$PIXI_HOME/bin` must be on `PATH` (same requirement as `pixi global`).
+
+**Why a sidecar instead of editing `pixi-global.toml`?**
+
+Pixi’s global manifest (`$PIXI_HOME/manifests/pixi-global.toml`) models **conda/PyPI dependencies** plus `exposed` mappings, and `pixi global sync` assumes it owns those environments. pixi-mise installs **GitHub release binaries**, which are not conda packages. Writing fake env entries into `pixi-global.toml` would risk sync conflicts and couple us to a schema without a stable “external binary provider” API.
+
+Decision: keep `$PIXI_HOME/pixi-mise.toml` + direct `$PIXI_HOME/bin` exposure. Conda globals stay under Pixi (`pixi global …`); GitHub globals stay under pixi-mise (`pixi mise global …`). Revisit only if Pixi adds a supported extension point for non-conda global binaries.
 ### 9.3 Why not generate Conda packages in v1?
 
 Generating a noarch/generic `.conda` and installing via rattler would integrate deeper with Pixi lockfiles, but adds packaging complexity (repodata, build strings, multi-platform). Direct prefix install matches mise’s model and unblocks the core UX faster. A future “export as conda package” backend remains compatible with this design.
@@ -495,11 +503,10 @@ Actionable errors, modeled on mise:
 
 ## 15. Open Questions
 
-1. **Global exposure API** — v1 uses symlinks into `$PIXI_HOME/bin` plus `$PIXI_HOME/pixi-mise.toml`. Revisit editing `pixi-global.toml` if a stable schema/API appears.
-2. **Lockfile location** — Workspace: commit `pixi-mise.lock` beside `pixi.lock`. Global: `$PIXI_HOME/pixi-mise.lock`.
-3. **Upgrade policy for `latest`** — Pin on first install (lockfile); bump within constraints on `update`, loosen manifest specs on `upgrade` (Pixi semantics).
-4. **Windows shims** — Copy `.exe` vs. generate `.cmd` wrappers when exposing globally (currently copy on non-Unix).
-5. **Multi-env workspaces** — Should tools be per-feature/per-environment in `pixi.toml`, or always default env unless flagged?
+1. **Lockfile location** — Workspace: commit `pixi-mise.lock` beside `pixi.lock`. Global: `$PIXI_HOME/pixi-mise.lock`.
+2. **Upgrade policy for `latest`** — Pin on first install (lockfile); bump within constraints on `update`, loosen manifest specs on `upgrade` (Pixi semantics).
+3. **Windows shims** — Copy `.exe` vs. generate `.cmd` wrappers when exposing globally (currently copy on non-Unix).
+4. **Multi-env workspaces** — Should tools be per-feature/per-environment in `pixi.toml`, or always default env unless flagged?
 
 ## 16. Success Criteria
 
