@@ -139,16 +139,7 @@ fn parse_tool_value(
 }
 
 fn parse_version_string(raw: &str) -> VersionSpec {
-    if raw.is_empty() || raw.eq_ignore_ascii_case("latest") {
-        VersionSpec::Latest
-    } else {
-        let stripped = raw.trim_start_matches('v');
-        if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit()) {
-            VersionSpec::Prefix(stripped.to_string())
-        } else {
-            VersionSpec::Exact(raw.to_string())
-        }
-    }
+    crate::version::parse_version_spec(raw)
 }
 
 /// Add or update a tool entry in `pixi.toml`.
@@ -369,6 +360,77 @@ pub fn remove_tool_from_global_config(id: &ToolId) -> Result<bool, CoreError> {
     Ok(removed)
 }
 
+/// Result of importing tools from a `mise.toml`.
+#[derive(Debug, Clone, Default)]
+pub struct MiseImportReport {
+    /// Tools added to `pixi.toml`.
+    pub added: Vec<String>,
+    /// Tools already present (skipped).
+    pub skipped: Vec<String>,
+    /// Non-github mise tools ignored.
+    pub ignored: Vec<String>,
+}
+
+/// Import `github:` tools from `mise.toml` / `.mise.toml` into workspace `pixi.toml`.
+pub fn import_mise_tools(
+    workspace_root: &Path,
+    dry_run: bool,
+) -> Result<MiseImportReport, CoreError> {
+    let mise_path = ["mise.toml", ".mise.toml", ".config/mise.toml"]
+        .iter()
+        .map(|p| workspace_root.join(p))
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            CoreError::Config("no mise.toml / .mise.toml found in workspace root".into())
+        })?;
+
+    let text = fs::read_to_string(&mise_path).map_err(|e| CoreError::Config(e.to_string()))?;
+    let doc: Value = text
+        .parse()
+        .map_err(|e| CoreError::Config(format!("parse {}: {e}", mise_path.display())))?;
+
+    let Some(tools) = doc.get("tools").and_then(|t| t.as_table()) else {
+        return Ok(MiseImportReport::default());
+    };
+
+    let existing = load_workspace_tools(workspace_root)?;
+    let pixi_toml = workspace_root.join("pixi.toml");
+    let mut report = MiseImportReport::default();
+
+    for (key, val) in tools {
+        let key = key.trim();
+        // mise forms: "github:owner/repo" = "1.2.3" or table with version
+        if !key.starts_with("github:") {
+            // Also accept backend-style "owner/repo" under tools with github: prefix missing —
+            // only import explicit github: keys.
+            report.ignored.push(key.to_string());
+            continue;
+        }
+        let (id, default_version) = parse_tool_spec(key)?;
+        let (version, mut options) = parse_tool_value(val, default_version)?;
+        // mise uses `version` / string; map common option aliases if present in table.
+        if let Value::Table(table) = val
+            && options.matching.is_none()
+            && let Some(m) = table.get("matching").and_then(|v| v.as_str())
+        {
+            options.matching = Some(m.to_string());
+        }
+        if existing.tools.iter().any(|t| t.id == id) {
+            report.skipped.push(id.github_spec());
+            continue;
+        }
+        report.added.push(format!(
+            "{} = \"{}\"",
+            id.github_spec(),
+            version.to_config_string()
+        ));
+        if !dry_run {
+            add_tool_to_pixi_toml(&pixi_toml, &id, &version, &options)?;
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +494,32 @@ name = "demo"
         assert!(remove_tool_from_pixi_toml(&toml_path, &id).unwrap());
         let cfg = load_workspace_tools(&root).unwrap();
         assert!(cfg.tools.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn import_mise_github_tools() {
+        let root = temp_workspace(
+            r#"
+[workspace]
+name = "demo"
+"#,
+        );
+        fs::write(
+            root.join("mise.toml"),
+            r#"
+[tools]
+"github:BurntSushi/ripgrep" = "14"
+node = "20"
+"github:cli/cli" = { version = "2.67.0" }
+"#,
+        )
+        .unwrap();
+        let report = import_mise_tools(&root, false).unwrap();
+        assert_eq!(report.added.len(), 2);
+        assert!(report.ignored.iter().any(|s| s == "node"));
+        let cfg = load_workspace_tools(&root).unwrap();
+        assert_eq!(cfg.tools.len(), 2);
         let _ = fs::remove_dir_all(&root);
     }
 }

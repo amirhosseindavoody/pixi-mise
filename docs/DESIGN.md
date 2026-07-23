@@ -481,10 +481,10 @@ Actionable errors, modeled on mise:
 - `pixi-mise.lock` with checksums.
 - `matching`, `asset_pattern`, `rename_exe`, `bin` (config keys partially accepted in Phase 1).
 
-### Phase 3 — Polish
+### Phase 3 — Polish ✅
 
-- `search`, `update` / `upgrade`, `reinstall`, `clean cache`, better semver.
-- Optional `mise.toml` github-tool import.
+- `search`, `update` / `upgrade`, `reinstall`, `clean cache`, better semver (`^` / `~` / prefix).
+- Optional `mise.toml` github-tool import (`import-mise`).
 - CI integration tests.
 
 ### Phase 4 — Registry (optional)
