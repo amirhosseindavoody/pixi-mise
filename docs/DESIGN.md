@@ -487,10 +487,11 @@ Actionable errors, modeled on mise:
 - Optional `mise.toml` github-tool import (`import-mise`).
 - CI integration tests.
 
-### Phase 4 — Registry (optional)
+### Phase 4 — Registry ✅
 
-- Consume aqua-registry (or a slim pixi-mise registry) for tools that need templates/overrides.
-- Platform-specific tool filters (`os = ["linux", "macos/arm64"]`).
+- Consume aqua-registry (per-package YAML) and optional local `pixi-mise-registry.toml` for asset templates / overrides.
+- Platform-specific tool filters (`os = ["linux", "macos/arm64"]`) plus aqua `supported_envs`.
+- `pixi mise registry <tool> [--tag …]` to inspect resolved recipes.
 
 ## 15. Open Questions
 

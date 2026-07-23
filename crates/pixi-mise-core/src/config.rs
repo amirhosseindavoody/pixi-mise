@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use toml::Value;
 
+use crate::registry::RegistrySettings;
 use crate::{
     ConfigSource, CoreError, ToolId, ToolOptions, ToolRequest, VersionSpec, parse_tool_spec,
 };
@@ -18,6 +19,8 @@ pub struct WorkspaceConfig {
     pub pixi_toml: PathBuf,
     /// Declared tools.
     pub tools: Vec<ToolRequest>,
+    /// Registry settings from `[tool.pixi-mise]`.
+    pub registry: RegistrySettings,
 }
 
 /// Walk parents looking for `pixi.toml`.
@@ -52,11 +55,73 @@ pub fn load_workspace_tools(workspace_root: &Path) -> Result<WorkspaceConfig, Co
         .parse()
         .map_err(|e| CoreError::Config(format!("parse pixi.toml: {e}")))?;
     let tools = parse_tools_table(&value, &pixi_toml)?;
+    let registry = parse_registry_settings(&value, workspace_root);
     Ok(WorkspaceConfig {
         root: workspace_root.to_path_buf(),
         pixi_toml,
         tools,
+        registry,
     })
+}
+
+/// Registry settings for a workspace (defaults when no `pixi.toml` section).
+pub fn workspace_registry_settings(workspace_root: &Path) -> RegistrySettings {
+    let pixi_toml = workspace_root.join("pixi.toml");
+    if !pixi_toml.is_file() {
+        return RegistrySettings::default();
+    }
+    let Ok(text) = fs::read_to_string(&pixi_toml) else {
+        return RegistrySettings::default();
+    };
+    let Ok(value) = text.parse::<Value>() else {
+        return RegistrySettings::default();
+    };
+    parse_registry_settings(&value, workspace_root)
+}
+
+fn parse_registry_settings(doc: &Value, workspace_root: &Path) -> RegistrySettings {
+    let mut settings = RegistrySettings::default();
+    let Some(table) = doc
+        .get("tool")
+        .and_then(|t| t.get("pixi-mise"))
+        .and_then(|t| t.as_table())
+    else {
+        // Auto-detect local slim registry beside pixi.toml.
+        let local = workspace_root.join("pixi-mise-registry.toml");
+        if local.is_file() {
+            settings.local_path = Some(local);
+        }
+        return settings;
+    };
+
+    if let Some(Value::Boolean(b)) = table.get("registry") {
+        settings.enabled = *b;
+    } else if let Some(Value::String(s)) = table.get("registry") {
+        match s.as_str() {
+            "false" | "off" | "none" => settings.enabled = false,
+            "aqua" | "true" | "on" => settings.enabled = true,
+            other => {
+                settings.enabled = true;
+                settings.aqua_base_url = other.to_string();
+            }
+        }
+    }
+
+    if let Some(path) = table.get("registry_path").and_then(|v| v.as_str()) {
+        let p = PathBuf::from(path);
+        settings.local_path = Some(if p.is_absolute() {
+            p
+        } else {
+            workspace_root.join(p)
+        });
+    } else {
+        let local = workspace_root.join("pixi-mise-registry.toml");
+        if local.is_file() {
+            settings.local_path = Some(local);
+        }
+    }
+
+    settings
 }
 
 fn parse_tools_table(doc: &Value, pixi_toml: &Path) -> Result<Vec<ToolRequest>, CoreError> {
@@ -130,11 +195,38 @@ fn parse_tool_value(
             if let Some(m) = table.get("expose_as").and_then(|v| v.as_str()) {
                 options.expose_as = Some(m.to_string());
             }
+            if let Some(b) = table.get("registry").and_then(|v| v.as_bool()) {
+                options.registry = Some(b);
+            }
+            if let Some(os_val) = table.get("os") {
+                options.os = parse_os_filter(os_val)?;
+            }
             Ok((version, options))
         }
         other => Err(CoreError::Config(format!(
             "unsupported tool value type: {other:?}"
         ))),
+    }
+}
+
+fn parse_os_filter(val: &Value) -> Result<Vec<String>, CoreError> {
+    match val {
+        Value::String(s) => Ok(vec![s.clone()]),
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                let Some(s) = item.as_str() else {
+                    return Err(CoreError::Config(
+                        "`os` entries must be strings (e.g. \"linux\", \"macos/arm64\")".into(),
+                    ));
+                };
+                out.push(s.to_string());
+            }
+            Ok(out)
+        }
+        _ => Err(CoreError::Config(
+            "`os` must be a string or array of strings".into(),
+        )),
     }
 }
 
@@ -191,7 +283,9 @@ fn tool_value_for_write(version: &VersionSpec, options: &ToolOptions) -> Value {
         || options.rename_exe.is_some()
         || options.version_prefix.is_some()
         || options.prerelease
-        || options.expose_as.is_some();
+        || options.expose_as.is_some()
+        || options.registry.is_some()
+        || !options.os.is_empty();
 
     if !has_options {
         return Value::String(version.to_config_string());
@@ -222,6 +316,15 @@ fn tool_value_for_write(version: &VersionSpec, options: &ToolOptions) -> Value {
     }
     if let Some(m) = &options.expose_as {
         table.insert("expose_as".into(), Value::String(m.clone()));
+    }
+    if let Some(b) = options.registry {
+        table.insert("registry".into(), Value::Boolean(b));
+    }
+    if !options.os.is_empty() {
+        table.insert(
+            "os".into(),
+            Value::Array(options.os.iter().cloned().map(Value::String).collect()),
+        );
     }
     Value::Table(table)
 }

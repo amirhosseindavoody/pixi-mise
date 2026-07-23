@@ -1,9 +1,12 @@
-//! Resolve `ToolRequest` → `ToolVersion` via GitHub + AssetPicker.
+//! Resolve `ToolRequest` → `ToolVersion` via GitHub + AssetPicker (+ optional registry).
 
 use pixi_mise_assets::{AssetCandidate, HostPlatform, PickOptions, pick_asset};
 use pixi_mise_github::{GithubClient, select_release};
 
 use crate::lockfile::LockEntry;
+use crate::registry::{
+    RegistrySettings, host_matches_os_filter, lookup_registry_hints, merge_registry_hints,
+};
 use crate::version::select_best_tag;
 use crate::{CoreError, ResolvedAsset, ToolRequest, ToolVersion, VersionSpec};
 
@@ -13,7 +16,7 @@ pub fn resolve_tool(
     request: &ToolRequest,
     host: &HostPlatform,
 ) -> Result<ToolVersion, CoreError> {
-    resolve_tool_with_lock(client, request, host, None)
+    resolve_tool_with_settings(client, request, host, None, &RegistrySettings::default())
 }
 
 /// Resolve using an optional lock entry for the current platform.
@@ -23,6 +26,25 @@ pub fn resolve_tool_with_lock(
     host: &HostPlatform,
     locked: Option<&LockEntry>,
 ) -> Result<ToolVersion, CoreError> {
+    resolve_tool_with_settings(client, request, host, locked, &RegistrySettings::default())
+}
+
+/// Resolve with explicit registry settings (workspace / CLI).
+pub fn resolve_tool_with_settings(
+    client: &GithubClient,
+    request: &ToolRequest,
+    host: &HostPlatform,
+    locked: Option<&LockEntry>,
+    registry: &RegistrySettings,
+) -> Result<ToolVersion, CoreError> {
+    if !host_matches_os_filter(host, &request.options.os) {
+        return Err(CoreError::UnsupportedPlatform {
+            tool: request.id.github_spec(),
+            platform: host.pixi_platform(),
+            reason: format!("os filter {:?} excludes this host", request.options.os),
+        });
+    }
+
     if let Some(entry) = locked
         && entry.id == request.id.github_spec()
         && entry.platform == host.pixi_platform()
@@ -81,6 +103,42 @@ pub fn resolve_tool_with_lock(
         }
     };
 
+    let mut request = request.clone();
+    let mut settings = registry.clone();
+    if let Some(flag) = request.options.registry {
+        settings.enabled = flag;
+    }
+
+    // Consult registry when the user did not pin an explicit asset_pattern.
+    if request.options.asset_pattern.is_none() {
+        match lookup_registry_hints(client, &settings, &request.id, &release.tag_name, host) {
+            Ok(Some(hints)) => {
+                if !hints.supported {
+                    return Err(CoreError::UnsupportedPlatform {
+                        tool: request.id.github_spec(),
+                        platform: host.pixi_platform(),
+                        reason: format!(
+                            "registry `supported_envs` from {} excludes this host",
+                            hints.source
+                        ),
+                    });
+                }
+                tracing::debug!(
+                    tool = %request.id.github_spec(),
+                    source = %hints.source,
+                    asset = ?hints.asset_pattern,
+                    "applied registry hints"
+                );
+                merge_registry_hints(&mut request.options, &hints);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Fail open: registry outages should not block AssetPicker installs.
+                tracing::warn!(error = %e, "registry lookup failed; falling back to AssetPicker");
+            }
+        }
+    }
+
     let candidates: Vec<AssetCandidate> = release
         .assets
         .iter()
@@ -92,6 +150,8 @@ pub fn resolve_tool_with_lock(
         .collect();
 
     let version = display_version(&release.tag_name, version_prefix);
+    // Prefer the raw tag for aqua `{{.Version}}` / `{{trimV .Version}}`.
+    let template_version = release.tag_name.clone();
 
     let picked = pick_asset(
         &candidates,
@@ -101,7 +161,9 @@ pub fn resolve_tool_with_lock(
             matching_regex: request.options.matching_regex.clone(),
             asset_pattern: request.options.asset_pattern.clone(),
             preferred_name: Some(repo.clone()),
-            version: Some(version.clone()),
+            version: Some(template_version),
+            format: request.options.registry_format.clone(),
+            replacements: request.options.registry_replacements.clone(),
         },
     )
     .map_err(|e| {
@@ -124,16 +186,17 @@ pub fn resolve_tool_with_lock(
             picked.name
         ))
     })?;
+    let checksum = request.options.checksum.clone();
 
     Ok(ToolVersion {
-        request: request.clone(),
+        request,
         version,
         tag: release.tag_name.clone(),
         asset: ResolvedAsset {
             name: picked.name,
             download_url,
             size: picked.size,
-            digest: request.options.checksum.clone(),
+            digest: checksum,
         },
     })
 }

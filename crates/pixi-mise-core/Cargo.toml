@@ -15,6 +15,7 @@ pixi-mise-assets = { workspace = true }
 pixi-mise-github = { workspace = true }
 pixi-mise-pixi = { workspace = true }
 serde = { workspace = true }
+serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }

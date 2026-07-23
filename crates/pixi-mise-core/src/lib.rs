@@ -6,6 +6,7 @@ mod config;
 mod extract;
 mod install;
 mod lockfile;
+mod registry;
 mod resolve;
 mod version;
 
@@ -20,14 +21,18 @@ pub use pixi_mise_pixi as pixi;
 pub use config::{
     GlobalConfig, WorkspaceConfig, add_tool_to_global_config, add_tool_to_pixi_toml,
     find_workspace_root, import_mise_tools, load_global_tools, load_workspace_tools,
-    remove_tool_from_global_config, remove_tool_from_pixi_toml,
+    remove_tool_from_global_config, remove_tool_from_pixi_toml, workspace_registry_settings,
 };
 pub use install::{
     InstallOutcome, cache_root, clear_cache, install_tool, install_tool_local,
     invalidate_cached_asset,
 };
 pub use lockfile::{LockEntry, Lockfile, sha256_file, verify_sha256};
-pub use resolve::{resolve_tool, resolve_tool_with_lock};
+pub use registry::{
+    RegistryHints, RegistrySettings, constraint_matches, env_matches_host, host_matches_os_filter,
+    lookup_registry_hints, merge_registry_hints,
+};
+pub use resolve::{resolve_tool, resolve_tool_with_lock, resolve_tool_with_settings};
 pub use version::{
     ParsedVersion, normalize_tag, parse_version, parse_version_spec, select_best_tag,
     tag_matches_spec,
@@ -65,6 +70,16 @@ pub enum CoreError {
     /// Requested tool is not in config.
     #[error("tool `{0}` is not configured in pixi.toml")]
     ToolNotConfigured(String),
+    /// Host platform is excluded by `os` / `supported_envs` filters.
+    #[error("tool `{tool}` is not supported on this platform ({platform}): {reason}")]
+    UnsupportedPlatform {
+        /// Tool id.
+        tool: String,
+        /// Host Pixi platform key.
+        platform: String,
+        /// Why it was skipped.
+        reason: String,
+    },
     /// Feature deferred to a later phase.
     #[error("{0}")]
     NotImplemented(&'static str),
@@ -150,6 +165,14 @@ pub struct ToolOptions {
     pub prerelease: bool,
     /// Global expose name override.
     pub expose_as: Option<String>,
+    /// Platform filter (`linux`, `macos/arm64`, `osx-arm64`, …). Empty = all.
+    pub os: Vec<String>,
+    /// Per-tool registry toggle (`None` = follow workspace default).
+    pub registry: Option<bool>,
+    /// Format hint filled from registry (`{{.Format}}`).
+    pub registry_format: Option<String>,
+    /// Replacements filled from registry.
+    pub registry_replacements: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Where a tool request was declared.
