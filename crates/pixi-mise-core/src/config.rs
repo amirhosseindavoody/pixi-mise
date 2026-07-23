@@ -727,7 +727,10 @@ hello = "echo hi"
         // Existing sections should still appear before the newly appended tools table.
         let deps_at = updated.find("[dependencies]").unwrap();
         let tools_at = updated.find("[tool.pixi-mise.tools]").unwrap();
-        assert!(deps_at < tools_at, "tools section was not appended:\n{updated}");
+        assert!(
+            deps_at < tools_at,
+            "tools section was not appended:\n{updated}"
+        );
 
         // Second add should only append to the tools table.
         let id2 = ToolId {
