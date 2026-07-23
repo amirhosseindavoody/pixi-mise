@@ -53,7 +53,9 @@ jobs:
           # Ensure a Pixi env prefix exists for local installs.
           (cd "$WORK" && pixi install)
           "$BIN" --version
-          "$BIN" search github:BurntSushi/ripgrep | head -n 5
+          "$BIN" search github:BurntSushi/ripgrep >"$WORK/search.txt"
+          head -n 5 "$WORK/search.txt"
+          grep -q "Recent releases for github:BurntSushi/ripgrep" "$WORK/search.txt"
           (cd "$WORK" && "$BIN" add github:BurntSushi/ripgrep@14)
           (cd "$WORK" && "$BIN" which rg)
           test -x "$WORK/.pixi/envs/default/bin/rg"

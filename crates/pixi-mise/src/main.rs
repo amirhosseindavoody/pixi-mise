@@ -21,11 +21,31 @@ use pixi_mise_core::{
 use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
+    install_broken_pipe_hook();
     if let Err(err) = try_main() {
         eprintln!("{err:?}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// Exit quietly when stdout is closed early (e.g. `pixi-mise search … | head`).
+///
+/// Rust ignores `SIGPIPE` by default, so `println!` panics on `BrokenPipe` instead.
+fn install_broken_pipe_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if msg.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
 }
 
 fn try_main() -> Result<()> {
