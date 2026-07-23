@@ -421,28 +421,73 @@ Rules:
 6. **Opt-out** — `[tool.pixi-mise] activation = false` or `pixi mise add --no-activation` skips wiring hooks (still writes the tools table and installs immediately as today).
 7. **Prerequisite** — `pixi-mise` must be on the outer `PATH` (e.g. via `pixi global install pixi-mise`) because activation scripts run with the system shell before the env is fully available.
 
-Example activate script (Unix):
+**Canonical script contents**
+
+`pixi mise add` generates these files verbatim (overwrite if the managed header is present; do not overwrite a user-edited file that dropped the header). Both scripts do one thing: run an env-scoped `pixi-mise install`, preferring `--locked` when `pixi-mise.lock` exists.
+
+`.pixi-mise/activate.sh` (Unix — Pixi runs activation with `bash`):
 
 ```bash
 #!/usr/bin/env bash
-# Managed by pixi-mise — installs GitHub tools for the active Pixi environment.
+# Managed by pixi-mise — do not edit (re-run `pixi mise add` to regenerate).
+# Installs GitHub release tools declared in pixi.toml into the active Pixi env.
 set -euo pipefail
+
 if ! command -v pixi-mise >/dev/null 2>&1; then
-  echo "pixi-mise: not on PATH; skip auto-install (pixi global install pixi-mise)" >&2
+  echo "pixi-mise: not on PATH; skip auto-install (try: pixi global install pixi-mise)" >&2
   exit 0
 fi
+
 env_name="${PIXI_ENVIRONMENT_NAME:-default}"
 root="${PIXI_PROJECT_ROOT:-.}"
-args=(install --environment "$env_name")
-if [[ -f "$root/pixi-mise.lock" ]]; then
-  args+=(--locked)
+
+if [[ -f "${root}/pixi-mise.lock" ]]; then
+  pixi-mise install --environment "${env_name}" --locked
+else
+  pixi-mise install --environment "${env_name}"
 fi
-pixi-mise "${args[@]}"
 ```
 
-Windows `.pixi-mise/activate.bat` mirrors the same logic with `%PIXI_ENVIRONMENT_NAME%` / `%PIXI_PROJECT_ROOT%`.
+`.pixi-mise/activate.bat` (Windows — Pixi runs activation with `cmd.exe`):
+
+```bat
+@echo off
+REM Managed by pixi-mise — do not edit (re-run `pixi mise add` to regenerate).
+REM Installs GitHub release tools declared in pixi.toml into the active Pixi env.
+
+where pixi-mise >nul 2>nul
+if errorlevel 1 (
+  echo pixi-mise: not on PATH; skip auto-install ^(try: pixi global install pixi-mise^) 1>&2
+  exit /b 0
+)
+
+set "env_name=%PIXI_ENVIRONMENT_NAME%"
+if "%env_name%"=="" set "env_name=default"
+
+set "root=%PIXI_PROJECT_ROOT%"
+if "%root%"=="" set "root=."
+
+if exist "%root%\pixi-mise.lock" (
+  pixi-mise install --environment "%env_name%" --locked
+) else (
+  pixi-mise install --environment "%env_name%"
+)
+```
+
+Behavior summary:
+
+| Step | Behavior |
+|------|----------|
+| Missing `pixi-mise` | Warn on stderr and exit 0 (do not fail `pixi shell` / `pixi run`) |
+| Env name | `PIXI_ENVIRONMENT_NAME`, else `default` |
+| Project root | `PIXI_PROJECT_ROOT`, else `.` (for lockfile lookup) |
+| Lockfile present | `pixi-mise install --environment <env> --locked` |
+| No lockfile | `pixi-mise install --environment <env>` |
+| Already installed | `install` is idempotent / fast no-op (implementation requirement) |
 
 **Why activation scripts (not tasks)?** Tasks require an explicit `pixi run …`. Activation runs on every `pixi shell` / `pixi run`, matching “open the workspace and tools are there.” Side effects (writing into `$PREFIX/bin`) persist even though Pixi only re-exports env vars from activation scripts into the shell.
+
+## 7. Resolution Pipeline
 
 ```text
 ToolRequest
