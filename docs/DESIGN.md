@@ -218,9 +218,10 @@ Optionally read a subset of `mise.toml` `[tools]` entries that use the `github:`
 
 ```text
 pixi-mise/
-├── Cargo.toml                 # workspace root
+├── Cargo.toml                 # workspace root + `pixi-mise` binary package
+├── pixi.toml                  # Pixi workspace + conda package (pixi-build-rust)
 ├── crates/
-│   ├── pixi-mise/             # binary crate → produces `pixi-mise`
+│   ├── pixi-mise/src/         # CLI binary sources
 │   ├── pixi-mise-core/        # config, types, resolve, install orchestration
 │   ├── pixi-mise-github/      # GitHub API client + release listing
 │   ├── pixi-mise-assets/      # AssetPicker scoring (mise-inspired)
