@@ -19,9 +19,11 @@ pub use pixi_mise_github as github;
 pub use pixi_mise_pixi as pixi;
 
 pub use config::{
-    GlobalConfig, WorkspaceConfig, add_tool_to_global_config, add_tool_to_pixi_toml,
-    find_workspace_root, import_mise_tools, load_global_tools, load_workspace_tools,
-    remove_tool_from_global_config, remove_tool_from_pixi_toml, workspace_registry_settings,
+    EnvSpec, GlobalConfig, MiseImportReport, WorkspaceConfig, activation_script_paths,
+    add_tool_to_global_config, add_tool_to_pixi_toml, cleanup_feature_activation,
+    ensure_activation_hooks, envs_including_feature, find_workspace_root, import_mise_tools,
+    load_global_tools, load_workspace_tools, remove_tool_from_global_config,
+    remove_tool_from_pixi_toml, tools_for_environment, workspace_registry_settings,
 };
 pub use install::{
     InstallOutcome, cache_root, clear_cache, install_tool, install_tool_local,
@@ -70,6 +72,16 @@ pub enum CoreError {
     /// Requested tool is not in config.
     #[error("tool `{0}` is not configured in pixi.toml")]
     ToolNotConfigured(String),
+    /// Same tool id appears in multiple features of one env with conflicting specs.
+    #[error("conflicting pixi-mise specs for `{tool}` in environment `{env}`: {detail}")]
+    ToolConflict {
+        /// Tool id (`github:…`).
+        tool: String,
+        /// Pixi environment name.
+        env: String,
+        /// Human-readable conflict detail.
+        detail: String,
+    },
     /// Host platform is excluded by `os` / `supported_envs` filters.
     #[error("tool `{tool}` is not supported on this platform ({platform}): {reason}")]
     UnsupportedPlatform {
@@ -184,6 +196,63 @@ pub struct ConfigSource {
     pub table: String,
 }
 
+/// Pixi feature that owns a local tool declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FeatureName {
+    /// Default feature → `[tool.pixi-mise.tools]`.
+    Default,
+    /// Named feature → `[tool.pixi-mise.feature.<name>.tools]`.
+    Named(String),
+}
+
+impl FeatureName {
+    /// Parse a CLI `--feature` value (`default` or empty → [`Self::Default`]).
+    pub fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+            Self::Default
+        } else {
+            Self::Named(trimmed.to_string())
+        }
+    }
+
+    /// Feature name for display (`default` or the named feature).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Default => "default",
+            Self::Named(name) => name.as_str(),
+        }
+    }
+
+    /// TOML table path for this feature's tools (e.g. `tool.pixi-mise.tools`).
+    pub fn tools_table(&self) -> String {
+        match self {
+            Self::Default => "tool.pixi-mise.tools".into(),
+            Self::Named(name) => format!("tool.pixi-mise.feature.{name}.tools"),
+        }
+    }
+
+    /// Dotted path segments for `toml_edit` under the document root.
+    pub fn tools_table_path(&self) -> Vec<String> {
+        match self {
+            Self::Default => vec!["tool".into(), "pixi-mise".into(), "tools".into()],
+            Self::Named(name) => vec![
+                "tool".into(),
+                "pixi-mise".into(),
+                "feature".into(),
+                name.clone(),
+                "tools".into(),
+            ],
+        }
+    }
+}
+
+impl std::fmt::Display for FeatureName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// User-facing tool request before resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolRequest {
@@ -197,6 +266,8 @@ pub struct ToolRequest {
     pub options: ToolOptions,
     /// Config provenance.
     pub source: ConfigSource,
+    /// Owning Pixi feature (local workspace only; global tools use [`FeatureName::Default`]).
+    pub feature: FeatureName,
 }
 
 /// Fully resolved tool version + chosen asset.
@@ -277,6 +348,16 @@ pub fn tool_request_from_spec(
     source: ConfigSource,
     options: ToolOptions,
 ) -> Result<ToolRequest, CoreError> {
+    tool_request_from_spec_feature(spec, source, options, FeatureName::Default)
+}
+
+/// Build a [`ToolRequest`] with an explicit feature.
+pub fn tool_request_from_spec_feature(
+    spec: &str,
+    source: ConfigSource,
+    options: ToolOptions,
+    feature: FeatureName,
+) -> Result<ToolRequest, CoreError> {
     let (id, version) = parse_tool_spec(&normalize_tool_arg(spec))?;
     Ok(ToolRequest {
         backend: BackendKind::Github,
@@ -284,6 +365,7 @@ pub fn tool_request_from_spec(
         version,
         options,
         source,
+        feature,
     })
 }
 
